@@ -1,4 +1,4 @@
-﻿# TeamsRecorder
+# TeamsRecorder
 
 A Windows tray app that records the audio of a Microsoft Teams meeting on this
 PC as **two WAV files**:
@@ -129,3 +129,22 @@ runtime as two directories above the executable when running from `bin\`
 
 - **Use a headset.** With open speakers the microphone also hears the far end, so the "Paul" track duplicates what everyone else said. A headset (or any mic that doesn't pick up the speakers) keeps the two tracks clean.
 - Verified live on 2026-09-04: hotkey → two-track capture → sidecar → diarized transcript → naming dialog, end to end on BEAST.
+
+## Start with Windows / Start Menu
+
+The right-click tray menu has two items for launching and discovering the app:
+
+- **Start with Windows** — creates or deletes a shortcut at
+  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\TeamsRecorder.lnk`
+  (per-user; no admin needed), so the app starts automatically at sign-in.
+  The check mark is refreshed every time the menu opens, so it always reflects
+  the current state.
+- **Create Start Menu shortcut** — writes
+  `%PROGRAMS%\TeamsRecorder\TeamsRecorder.lnk` (the per-user Programs folder,
+  no admin needed) so the app is findable in the Start Menu; a balloon tip
+  confirms it.
+
+Both shortcuts are built by `src/TeamsRecorder/Shortcuts.cs` via the late-bound
+`WScript.Shell` COM object — no extra packages. On every launch the app also
+re-writes the Start Menu shortcut if its target no longer matches the running
+exe (e.g. after a rebuild), so the Programs entry never goes stale.

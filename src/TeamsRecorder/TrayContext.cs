@@ -18,6 +18,7 @@ public sealed class TrayContext : ApplicationContext
     private readonly Settings _settings;
     private readonly ToolStripMenuItem _nameSpeakersItem;
     private readonly ToolStripMenuItem _openTranscriptItem;
+    private readonly ToolStripMenuItem _startWithWindowsItem;
     private DateTime _startedAt;
     private Icon? _recordingIcon;
 
@@ -59,6 +60,12 @@ public sealed class TrayContext : ApplicationContext
         var openFolderItem = new ToolStripMenuItem("Open recordings folder");
         openFolderItem.Click += (_, _) => OpenRecordingsFolder();
 
+        _startWithWindowsItem = new ToolStripMenuItem("Start with Windows");
+        _startWithWindowsItem.Click += (_, _) => ToggleStartWithWindows();
+
+        var createShortcutItem = new ToolStripMenuItem("Create Start Menu shortcut");
+        createShortcutItem.Click += (_, _) => CreateStartMenuShortcut();
+
         var settingsItem = new ToolStripMenuItem("Settings…");
         settingsItem.Click += (_, _) => OpenSettings();
 
@@ -66,6 +73,8 @@ public sealed class TrayContext : ApplicationContext
         exitItem.Click += (_, _) => ExitApp();
 
         var menu = new ContextMenuStrip();
+        // Keep the "Start with Windows" check state current every time the menu opens.
+        menu.Opening += (_, _) => _startWithWindowsItem.Checked = Shortcuts.StartupEnabled;
         menu.Items.Add(_startItem);
         menu.Items.Add(_stopItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -73,6 +82,8 @@ public sealed class TrayContext : ApplicationContext
         menu.Items.Add(_openTranscriptItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(openFolderItem);
+        menu.Items.Add(_startWithWindowsItem);
+        menu.Items.Add(createShortcutItem);
         menu.Items.Add(settingsItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
@@ -89,6 +100,11 @@ public sealed class TrayContext : ApplicationContext
             Text = "Teams Recorder — idle",
         };
         _notifyIcon.DoubleClick += (_, _) => ToggleRecording();
+
+        // Make sure the Start Menu (Programs) entry points at this exe, even
+        // after a rebuild moved it. Failures are silent — this is best-effort.
+        try { Shortcuts.EnsureStartMenuShortcut(); }
+        catch { /* best-effort on startup */ }
 
         // --- Hotkey ---
         _hotkeys.HotkeyPressed += ToggleRecording;
@@ -181,6 +197,36 @@ public sealed class TrayContext : ApplicationContext
                 FileName = _settings.OutputFolder,
                 UseShellExecute = true,
             });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "Teams Recorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private void ToggleStartWithWindows()
+    {
+        var enable = !Shortcuts.StartupEnabled;
+        try
+        {
+            Shortcuts.SetStartup(enable);
+            _startWithWindowsItem.Checked = enable;
+            ShowBalloon("Start with Windows",
+                enable ? "Teams Recorder will start automatically when you sign in." :
+                          "Teams Recorder will no longer start automatically.");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "Teams Recorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private void CreateStartMenuShortcut()
+    {
+        try
+        {
+            Shortcuts.EnsureStartMenuShortcut();
+            ShowBalloon("Shortcut created", "Teams Recorder is available in the Start Menu.");
         }
         catch (Exception ex)
         {
