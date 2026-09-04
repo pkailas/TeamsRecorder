@@ -287,7 +287,8 @@ def run_transcription(args) -> int:
                 word_text = words[i]["word"]
                 if utterances and utterances[-1]["speaker"] == speaker:
                     utterances[-1]["end"] = wend
-                    utterances[-1]["text"] += " " + word_text
+                    # faster-whisper words already carry a leading space
+                    utterances[-1]["text"] += word_text
                 else:
                     utterances.append({
                         "start": float(wstart), "end": float(wend),
