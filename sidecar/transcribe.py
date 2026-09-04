@@ -8,8 +8,16 @@ Transcribes the two WAV files produced by the tray app:
 
 and writes <out>/transcript.json and <out>/transcript.md.
 
+Speakers that were already enrolled (via `rename`) are recognised
+automatically: each diarized speaker's voice embedding is matched by cosine
+similarity against the store in %LOCALAPPDATA%\\TeamsRecorder\\speakers.json
+(override with --speakers-file).
+
 Run the sidecar via:
   sidecar\\.venv\\Scripts\\python.exe sidecar\\transcribe.py --mic ... --loopback ... --out ...
+
+Rename / enroll a speaker (no GPU needed):
+  sidecar\\.venv\\Scripts\\python.exe sidecar\\transcribe.py rename --session <dir> --assign "Speaker 1=Sean"
 
 Self-test (acceptance check for GPU):
   python transcribe.py --selftest
@@ -103,43 +111,101 @@ def load_wav_mono_float32(path: str | Path, target_rate: int = 16000) -> np.ndar
 
 
 # --------------------------------------------------------------------------
-# Diarization (pyannote)
+# Speaker store (enrolled voice embeddings)
 # --------------------------------------------------------------------------
-def _run_pipeline(pipeline, wav_path: str | Path, sr: int):
+def default_speakers_file() -> Path:
+    localappdata = os.environ.get("LOCALAPPDATA", str(Path.home()))
+    return Path(localappdata) / "TeamsRecorder" / "speakers.json"
+
+
+MAX_EMBEDDINGS_PER_NAME = 5
+
+
+def load_speaker_store(path: str | Path) -> dict:
+    """Load the speaker store. Missing file / bad JSON = no known speakers."""
+    p = Path(path)
+    if not p.exists():
+        return {"version": 1, "speakers": []}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("speakers"), list):
+            raise ValueError("malformed speaker store")
+        return data
+    except Exception as e:
+        log(f"Speaker store {p} is unreadable ({e}); starting with an empty store.")
+        return {"version": 1, "speakers": []}
+
+
+def save_speaker_store(path: str | Path, store: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(store, f, indent=2, ensure_ascii=False)
+    log(f"Wrote {p}")
+
+
+def get_or_create_name(store: dict, name: str) -> dict:
+    for sp in store["speakers"]:
+        if sp["name"] == name:
+            return sp
+    sp = {"name": name, "embeddings": [], "updated": ""}
+    store["speakers"].append(sp)
+    return sp
+
+
+def add_embedding_to_store(store: dict, name: str, embedding: list[float]) -> None:
+    """Append an embedding under `name`, keeping at most 5 (oldest dropped first)."""
+    sp = get_or_create_name(store, name)
+    emb = [float(x) for x in embedding]
+    sp["embeddings"].append(emb)
+    if len(sp["embeddings"]) > MAX_EMBEDDINGS_PER_NAME:
+        sp["embeddings"] = sp["embeddings"][-MAX_EMBEDDINGS_PER_NAME:]
+    sp["updated"] = datetime.now().isoformat(timespec="seconds")
+
+
+def match_speakers(store: dict, candidates: list[tuple[str, np.ndarray]],
+                   threshold: float) -> dict:
     """
-    Run the pyannote pipeline, preloading the waveform into memory because
-    pyannote.audio 4.x's built-in file decoder (torchcodec) cannot find FFmpeg
-    DLLs on this Windows setup. Preloading via the {'waveform', 'sample_rate'}
-    dict bypasses file decoding entirely (torchaudio does the resampling).
+    Match diarized speaker embeddings against the store.
+
+    candidates: list of (diarization_label, embedding) in order of first
+    appearance of the label.
+
+    For each candidate, the best (name, score) over ALL stored embeddings is
+    computed, then assignments are resolved greedily by descending score so
+    that two diarized speakers never resolve to the same name (the loser
+    falls back to null).
+
+    Returns {diarization_label: {"name": str|None, "match_score": float|None,
+                                 "best_candidate": str|None}}
     """
-    import torch
+    results = {}
+    pairs = []  # (score, index, name)
+    for idx, (label, emb) in enumerate(candidates):
+        best_name, best_score = None, -2.0
+        for sp in store["speakers"]:
+            for stored in sp["embeddings"]:
+                s = float(np.dot(emb, np.asarray(stored, dtype=np.float64)))
+                if s > best_score:
+                    best_name, best_score = sp["name"], s
+        results[label] = {
+            "name": None,
+            "match_score": best_score,
+            "best_candidate": best_name,
+        }
+        if best_name is not None:
+            pairs.append((best_score, idx, best_name))
 
-    mono = load_wav_mono_float32(wav_path, target_rate=16000)
-    waveform = torch.from_numpy(mono).unsqueeze(0)  # (1, T)
-    wf = {"uri": str(wav_path), "audio": str(wav_path),
-          "waveform": waveform, "sample_rate": int(sr)}
-    return pipeline(wf)
-
-
-def diarize(pipeline, wav_path: str | Path, sr: int = 16000):
-    """
-    Run the pyannote pipeline on a wav file.
-
-    Returns a list of (start_sec, end_sec, label) tuples and the raw output
-    object (so the caller can print its type / dir() for diagnostics).
-    """
-    output = _run_pipeline(pipeline, wav_path, sr)
-
-    # pyannote/speaker-diarization-community-1 (4.x) returns a DiarizationObject
-    # exposing:
-    #   output.speaker_diarization            -> iterable of (turn, speaker)
-    #   output.exclusive_speaker_diarization  -> one speaker at a time (we use this)
-    diar = output.exclusive_speaker_diarization
-    turns = []
-    for turn, speaker in diar:
-        turns.append((float(turn.start), float(turn.end), str(speaker)))
-    turns.sort(key=lambda t: t[0])
-    return turns, output
+    pairs.sort(key=lambda t: -t[0])
+    taken_names = set()
+    for score, idx, name in pairs:
+        label, _emb = candidates[idx]
+        if score >= threshold and name not in taken_names:
+            taken_names.add(name)
+            results[label]["name"] = name
+        # else: stays name=None (falls back to Speaker N); best_candidate kept
+    return results
 
 
 # --------------------------------------------------------------------------
@@ -162,15 +228,129 @@ def assign_words_to_speakers(words, turns):
             if overlap > best_overlap:
                 best, best_overlap = tl, overlap
         if best is None:
-            # no overlap: nearest turn midpoint
-            mid_target = (w.start + w.end) / 2.0
-            best = min(turns, key=lambda t: abs((t[0] + t[1]) / 2.0 - mid_target))[2]
+            # no overlap: nearest turn *edge* (distance from the word to the
+            # turn interval). Nearest-midpoint was biased toward short turns
+            # and mis-assigned words that fall in the gap between speakers.
+            best = min(turns, key=lambda t: max(t[0] - w.end, w.start - t[1], 0.0))[2]
         labeled.append((w.start, w.end, best))
     return labeled
 
 
 # --------------------------------------------------------------------------
-# Pipeline
+# Speaker embeddings (voice enrollment vectors)
+# --------------------------------------------------------------------------
+def compute_speaker_embeddings(wav_path: Path, sr: int, turns: list) -> dict:
+    """
+    Compute one L2-normalized embedding per diarization label present in
+    `turns` (list of (start, end, label)), sorted by duration descending.
+
+    Uses the pyannote wespeaker-voxceleb-resnet34-LM embedding model with
+    Inference(window="whole"): the speaker's waveform slices are concatenated
+    up to 20 s total (turns < 0.5 s are skipped), the vector is L2-normalized.
+
+    Returns {label: np.ndarray (256,)} — labels with no usable audio are absent.
+    """
+    import torch
+    from pyannote.audio import Model, Inference
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log(f"Loading pyannote/wespeaker-voxceleb-resnet34-LM on {device}...")
+    model = Model.from_pretrained(
+        "pyannote/wespeaker-voxceleb-resnet34-LM",
+        token=os.environ["HF_TOKEN"])
+    inf = Inference(model, window="whole").to(device)
+
+    mono = load_wav_mono_float32(wav_path, target_rate=sr)
+
+    by_label: dict[str, list] = {}
+    for s, e, l in turns:
+        by_label.setdefault(l, []).append((s, e))
+
+    embeddings = {}
+    for label, segs in by_label.items():
+        segs.sort(key=lambda t: -(t[1] - t[0]))
+        chunks, total = [], 0.0
+        for s, e in segs:
+            if e - s < 0.5:
+                continue
+            if total >= 20.0:
+                break
+            i0 = int(s * sr)
+            i1 = min(int(e * sr), len(mono))
+            i0 = min(i0, i1)
+            if i1 - i0 < 1:
+                continue
+            chunks.append(mono[i0:i1])
+            total += (e - s)
+        if not chunks:
+            log(f"No usable audio for {label} (no turn >= 0.5 s) — no embedding.")
+            continue
+        x = np.concatenate(chunks).astype(np.float32)[: 20 * sr]
+        out = inf({"waveform": torch.from_numpy(x)[None, :], "sample_rate": int(sr)})
+        v = np.asarray(out).reshape(-1).astype(np.float64)
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v = v / n
+        embeddings[label] = v
+        log(f"Embedded {label}: {len(chunks)} segment(s), {total:.1f}s -> dim {v.shape[0]}.")
+    return embeddings
+
+
+# --------------------------------------------------------------------------
+# Transcript output (one writer for both modes)
+# --------------------------------------------------------------------------
+def write_transcript_md(out_dir: Path, result: dict) -> Path:
+    """Write <out_dir>/transcript.md from a transcript dict."""
+    md_path = out_dir / "transcript.md"
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(f"# {out_dir.name}\n\n")
+        for u in result.get("utterances", []):
+            f.write(f"**[{fmt_hms(u['start'])}] {u['speaker']}:** {u['text']}\n")
+    return md_path
+
+
+def transcript_result(args, model_name: str, paul_utterances: list,
+                      loopback_utterances: list, diar_turns_out: list,
+                      speaker_map: list | None, notes: list,
+                      total_duration: float) -> dict:
+    """Assemble the transcript.json payload (shared by normal and rename modes)."""
+    all_utterances = paul_utterances + loopback_utterances
+    all_utterances.sort(key=lambda u: u["start"])
+
+    speakers = ["Paul"] if any(u["speaker"] == "Paul" for u in all_utterances) else []
+    seen = set()
+    for u in all_utterances:
+        if u["speaker"] not in seen:
+            seen.add(u["speaker"])
+            if u["speaker"] != "Paul":
+                speakers.append(u["speaker"])
+
+    result = {
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "model": model_name,
+        "duration_sec": round(total_duration, 3),
+        "speakers": speakers,
+        "utterances": all_utterances,
+        "diarization": diar_turns_out,
+    }
+    if speaker_map is not None:
+        result["speaker_map"] = speaker_map
+    if notes:
+        result["notes"] = notes
+    return result
+
+
+def write_transcript(out_dir: Path, result: dict) -> None:
+    json_path = out_dir / "transcript.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    log(f"Wrote {json_path}")
+    md_path = write_transcript_md(out_dir, result)
+    log(f"Wrote {md_path}")
+
+
+# --------------------------------------------------------------------------
+# Pipeline (normal mode)
 # --------------------------------------------------------------------------
 def run_transcription(args) -> int:
     import torch
@@ -198,9 +378,12 @@ def run_transcription(args) -> int:
         """
         log(f"Transcribing {path_str}")
         audio = load_wav_mono_float32(path_str, target_rate=16000)
+        # initial_prompt nudges Whisper toward punctuated, cased output (it
+        # sometimes drops both on flat or synthetic audio).
         seg_iter, _info = model.transcribe(
             audio, language=args.language,
-            word_timestamps=True, vad_filter=True)
+            word_timestamps=True, vad_filter=True,
+            initial_prompt="Hello, welcome to the meeting. Let's get started.")
         segments = []
         for seg in seg_iter:
             segments.append({
@@ -235,8 +418,11 @@ def run_transcription(args) -> int:
     loopback_path = Path(args.loopback)
     loopback_utterances = []
     diar_turns_out = []
+    speaker_map = []
+    loopback_total = 0.0
     if loopback_path.exists():
         dur = wav_duration_seconds(loopback_path)
+        loopback_total = max(loopback_total, dur)
         if dur < 1.0:
             notes.append(f"loopback.wav is only {dur:.2f}s — skipped (too short).")
             log(notes[-1])
@@ -262,13 +448,42 @@ def run_transcription(args) -> int:
             diar_turns_out = [{"start": s, "end": e, "label": l} for (s, e, l) in turns]
             log(f"Diarization: {len(turns)} turns: {turns[:5]}{'...' if len(turns) > 5 else ''}")
 
-            # Map SPEAKER_xx -> Speaker N (order of first appearance).
+            # -- Speaker voice embeddings + name matching ------------------
+            emb_by_label: dict[str, np.ndarray] = {}
+            if turns and not args.no_embeddings:
+                emb_by_label = compute_speaker_embeddings(loopback_path, 16000, turns)
+
+            # Match against the enrolled speaker store (read-only here).
+            match = {}
+            if emb_by_label:
+                speakers_file = Path(args.speakers_file) if args.speakers_file \
+                    else default_speakers_file()
+                store = load_speaker_store(speakers_file)
+                # candidates in order of first appearance of the label
+                first_seen: list[str] = []
+                for _s, _e, l in turns:
+                    if l not in first_seen and l in emb_by_label:
+                        first_seen.append(l)
+                match = match_speakers(
+                    store,
+                    [(l, emb_by_label[l]) for l in first_seen],
+                    threshold=args.match_threshold)
+                for l in first_seen:
+                    m = match[l]
+                    log(f"Match {l}: best={m['best_candidate']} "
+                        f"score={m['match_score']:.4f} -> {m['name']}")
+
+            # Map SPEAKER_xx -> Speaker N (unnamed) or the matched name.
             label_map = {}
             counter = 0
             for _s, _e, l in turns:
                 if l not in label_map:
-                    counter += 1
-                    label_map[l] = f"Speaker {counter}"
+                    m = match.get(l)
+                    if m is not None and m.get("name"):
+                        label_map[l] = m["name"]
+                    else:
+                        counter += 1
+                        label_map[l] = f"Speaker {counter}"
 
             # Assign words to speakers, then group into utterances (one pass).
             class _W:
@@ -296,21 +511,43 @@ def run_transcription(args) -> int:
             for u in utterances:
                 u["text"] = u["text"].strip()
             loopback_utterances = [u for u in utterances if u["text"]]
+
+            # -- speaker_map (one entry per diarized speaker, in order of
+            #    first appearance; only labels that have an embedding) -----
+            talk_time: dict[str, float] = {}
+            for s, e, l in turns:
+                talk_time[l] = talk_time.get(l, 0.0) + (e - s)
+
+            if turns:
+                # order of first appearance over ALL labels (even without embeddings)
+                first_all: list[str] = []
+                for _s, _e, l in turns:
+                    if l not in first_all:
+                        first_all.append(l)
+                for l in first_all:
+                    m = match.get(l, {})
+                    emb = emb_by_label.get(l)
+                    sample_text = ""
+                    for u in loopback_utterances:
+                        if u["speaker"] == label_map.get(l, l):
+                            if len(u["text"]) > len(sample_text):
+                                sample_text = u["text"]
+                    entry = {
+                        "label": label_map.get(l, l),
+                        "diarization_label": l,
+                        "name": m.get("name"),
+                        "match_score": (round(m["match_score"], 6)
+                                        if m.get("match_score") is not None else None),
+                        "best_candidate": m.get("best_candidate"),
+                        "talk_time_sec": round(talk_time.get(l, 0.0), 3),
+                        "sample_text": (sample_text or "")[:200],
+                        "embedding": (emb.tolist() if emb is not None else None),
+                    }
+                    speaker_map.append(entry)
     else:
         notes.append(f"loopback wav not found: {loopback_path}")
 
     # -- Merge -------------------------------------------------------------
-    all_utterances = paul_utterances + loopback_utterances
-    all_utterances.sort(key=lambda u: u["start"])
-
-    speakers = ["Paul"] if any(u["speaker"] == "Paul" for u in all_utterances) else []
-    seen = set()
-    for u in all_utterances:
-        if u["speaker"] not in seen:
-            seen.add(u["speaker"])
-            if u["speaker"] != "Paul":
-                speakers.append(u["speaker"])
-
     total_duration = 0.0
     for p in (mic_path, loopback_path):
         if p.exists():
@@ -319,35 +556,112 @@ def run_transcription(args) -> int:
             except Exception:
                 pass
 
-    created = datetime.now().isoformat(timespec="seconds")
+    result = transcript_result(
+        args, model_name, paul_utterances, loopback_utterances,
+        diar_turns_out, speaker_map, notes, total_duration)
 
-    result = {
-        "created": created,
-        "model": model_name,
-        "duration_sec": round(total_duration, 3),
-        "speakers": speakers,
-        "utterances": all_utterances,
-        "diarization": diar_turns_out,
-    }
-    if notes:
-        result["notes"] = notes
-
-    json_path = out_dir / "transcript.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-    log(f"Wrote {json_path}")
-
-    md_path = out_dir / "transcript.md"
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(f"# {out_dir.name}\n\n")
-        for u in all_utterances:
-            f.write(f"**[{fmt_hms(u['start'])}] {u['speaker']}:** {u['text']}\n")
-    log(f"Wrote {md_path}")
+    write_transcript(out_dir, result)
 
     # -- Free GPU ----------------------------------------------------------
     del model
     torch.cuda.empty_cache()
-    log(f"Done: {len(all_utterances)} utterances.")
+    log(f"Done: {len(result['utterances'])} utterances.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Rename / enroll sub-mode (no GPU)
+# --------------------------------------------------------------------------
+def cmd_rename(args) -> int:
+    session = Path(args.session)
+    json_path = session / "transcript.json"
+    if not json_path.exists():
+        print(f"error: {json_path} not found", file=sys.stderr)
+        return 1
+    with open(json_path, "r", encoding="utf-8") as f:
+        result = json.load(f)
+
+    old_label_map: dict[str, str] = {}  # old label -> new name
+    new_labels: dict[str, str] = {}     # new label -> new label
+    speakers_file = Path(args.speakers_file) if args.speakers_file \
+        else default_speakers_file()
+    store = load_speaker_store(speakers_file)
+    store_dirty = False
+
+    speaker_map = result.get("speaker_map")
+    for raw in args.assign:
+        if "=" not in raw:
+            print(f"error: --assign expects 'OldLabel=NewName', got: {raw}",
+                  file=sys.stderr)
+            return 1
+        old, new = raw.split("=", 1)
+        old, new = old.strip(), new.strip()
+        if not old or not new:
+            print(f"error: --assign needs non-empty both sides, got: {raw}",
+                  file=sys.stderr)
+            return 1
+        if old in old_label_map:
+            print(f"error: --assign duplicates source label: {old}", file=sys.stderr)
+            return 1
+        if new in new_labels.values():
+            print(f"error: --assign duplicates target name: {new}", file=sys.stderr)
+            return 1
+        old_label_map[old] = new
+        new_labels[new] = new
+
+    if not old_label_map:
+        print("error: no --assign arguments given", file=sys.stderr)
+        return 1
+
+    # Enroll embeddings (unless --no-enroll) and collect missing labels.
+    missing = []
+    for old, new in old_label_map.items():
+        entry = None
+        for e in (speaker_map or []):
+            if e.get("label") == old:
+                entry = e
+                break
+        if entry is None:
+            missing.append(old)
+            entry = {"embedding": None}
+        if not args.no_enroll and entry.get("embedding") is not None:
+            add_embedding_to_store(store, new, entry["embedding"])
+            store_dirty = True
+
+    # Apply the rename: speaker_map labels, utterance speakers, speakers list.
+    for e in (speaker_map or []):
+        if e.get("label") in old_label_map:
+            new_name = old_label_map[e["label"]]
+            e["label"] = new_name
+            if e.get("name") is None:
+                e["name"] = new_name
+        elif e.get("label") in new_labels.values():
+            # a label that is already a previously-assigned name: leave as-is
+            pass
+    for u in result.get("utterances", []):
+        if u.get("speaker") in old_label_map:
+            u["speaker"] = old_label_map[u["speaker"]]
+    result["speakers"] = [
+        old_label_map.get(s, s) for s in result.get("speakers", [])]
+    # rebuild "speakers" preserving first-appearance order over all utterances
+    seen = set()
+    result["speakers"] = []
+    paul = any(u.get("speaker") == "Paul" for u in result.get("utterances", []))
+    if paul:
+        result["speakers"].append("Paul")
+    for u in result.get("utterances", []):
+        sp = u.get("speaker")
+        if sp and sp != "Paul" and sp not in seen:
+            seen.add(sp)
+            result["speakers"].append(sp)
+
+    if store_dirty:
+        save_speaker_store(speakers_file, store)
+
+    write_transcript(session, result)
+    for old, new in old_label_map.items():
+        log(f"Renamed {old!r} -> {new!r}"
+            + ("" if not args.no_enroll else " (not enrolled)"))
     return 0
 
 
@@ -420,9 +734,51 @@ def run_selftest() -> int:
 
 
 # --------------------------------------------------------------------------
+# Diarization (pyannote)
+# --------------------------------------------------------------------------
+def _run_pipeline(pipeline, wav_path: str | Path, sr: int):
+    """
+    Run the pyannote pipeline, preloading the waveform into memory because
+    pyannote.audio 4.x's built-in file decoder (torchcodec) cannot find FFmpeg
+    DLLs on this Windows setup. Preloading via the {'waveform', 'sample_rate'}
+    dict bypasses file decoding entirely (torchaudio does the resampling).
+    """
+    import torch
+
+    mono = load_wav_mono_float32(wav_path, target_rate=16000)
+    waveform = torch.from_numpy(mono).unsqueeze(0)  # (1, T)
+    wf = {"uri": str(wav_path), "audio": str(wav_path),
+          "waveform": waveform, "sample_rate": int(sr)}
+    return pipeline(wf)
+
+
+def diarize(pipeline, wav_path: str | Path, sr: int = 16000):
+    """
+    Run the pyannote pipeline on a wav file.
+
+    Returns a list of (start_sec, end_sec, label) tuples and the raw output
+    object (so the caller can print its type / dir() for diagnostics).
+    """
+    output = _run_pipeline(pipeline, wav_path, sr)
+
+    # pyannote/speaker-diarization-community-1 (4.x) returns a DiarizeOutput
+    # exposing:
+    #   output.speaker_diarization            -> iterable of (turn, speaker)
+    #   output.exclusive_speaker_diarization  -> one speaker at a time (we use this)
+    #   output.speaker_embeddings             -> (num_speakers, dim) centroids
+    #                                            ordered by diarization.labels()
+    diar = output.exclusive_speaker_diarization
+    turns = []
+    for turn, speaker in diar:
+        turns.append((float(turn.start), float(turn.end), str(speaker)))
+    turns.sort(key=lambda t: t[0])
+    return turns, output
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TeamsRecorder transcription sidecar")
     parser.add_argument("--mic", help="Path to mic.wav (local user, 'Paul')")
     parser.add_argument("--loopback", help="Path to loopback.wav (everyone else)")
@@ -433,11 +789,47 @@ def main() -> int:
                         help="Transcription language (default: en)")
     parser.add_argument("--selftest", action="store_true",
                         help="Run the GPU self-test and exit.")
+    parser.add_argument("--no-embeddings", action="store_true",
+                        help="Skip computing speaker voice embeddings "
+                             "(no name matching).")
+    parser.add_argument("--speakers-file",
+                        help="Speaker store JSON path "
+                             "(default: %%LOCALAPPDATA%%\\TeamsRecorder\\speakers.json).")
+    parser.add_argument("--match-threshold", type=float, default=0.60,
+                        help="Minimum cosine similarity to label a diarized "
+                             "speaker with an enrolled name (default: 0.60).")
+    sub = parser.add_subparsers(dest="command")
+    rp = sub.add_parser(
+        "rename",
+        help="Rename/enroll speakers in an existing session's transcript "
+             "(no GPU needed).")
+    rp.add_argument("--session", required=True,
+                    help="Session directory containing transcript.json.")
+    rp.add_argument("--assign", action="append", default=[],
+                    help="'OldLabel=NewName', e.g. 'Speaker 1=Sean'. Repeatable.")
+    rp.add_argument("--no-enroll", action="store_true",
+                    help="Do not append the renamed speakers' embeddings to "
+                         "the store.")
+    rp.add_argument("--speakers-file",
+                    help="Speaker store JSON path "
+                         "(default: %%LOCALAPPDATA%%\\TeamsRecorder\\speakers.json).")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.selftest:
         return run_selftest()
 
+    if args.command == "rename":
+        if not args.session:
+            print("error: rename requires --session", file=sys.stderr)
+            return 1
+        return cmd_rename(args)
+
+    # default: normal transcription mode
     missing = [a for a in ("mic", "loopback", "out") if not getattr(args, a)]
     if missing:
         print(f"error: missing required argument(s): {', '.join('--' + m for m in missing)}",

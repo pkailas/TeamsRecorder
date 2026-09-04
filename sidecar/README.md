@@ -7,6 +7,12 @@ Transcribes the two WAV files recorded by the tray app:
   is assigned to the diarization turn it overlaps (or the nearest turn
   midpoint), producing `Speaker 1`, `Speaker 2`, … in order of first appearance.
 
+  Recurring participants get named automatically: each diarized speaker's
+  voice embedding (wespeaker-voxceleb-resnet34-LM, 256-D, L2-normalized) is
+  matched by cosine similarity against the speaker store below, and labels
+  with a score ≥ the match threshold (default 0.60) are labelled with the
+  enrolled name instead of `Speaker N`.
+
 Outputs (written into the session folder):
 
 - `transcript.json` — machine-readable:
@@ -22,9 +28,28 @@ Outputs (written into the session folder):
     ],
     "diarization": [
       {"start": 0.5, "end": 2.0, "label": "SPEAKER_00"}
+    ],
+    "speaker_map": [
+      {
+        "label": "Speaker 1",
+        "diarization_label": "SPEAKER_00",
+        "name": null,
+        "match_score": 0.42,
+        "best_candidate": "Sean",
+        "talk_time_sec": 12.3,
+        "sample_text": "...longest utterance, ≤ 200 chars...",
+        "embedding": [0.01, "...256 floats..."]
+      }
     ]
   }
   ```
+
+  `speaker_map` has one entry per diarized speaker (order of first appearance),
+  so the C# app can build its speaker-naming dialog from it:
+  `name`/`match_score` are `null` when no enrolled name matched (or when
+  `--no-embeddings` was used), `best_candidate` is the closest stored name
+  even below the threshold, and `embedding` is the L2-normalized 256-D voice
+  vector.
 
   A `notes` array is added when a track is skipped (e.g. WAV shorter than 1 s).
 
@@ -86,9 +111,58 @@ The tray app calls this automatically. Manual invocation:
     --out .\sessions
 ```
 
-Options: `--model large-v3` (default), `--language en` (default), `--selftest`
-(ignores the other args; generates a 4 s 440 Hz sine WAV, loads **both** models
-on CUDA, runs transcription + diarization, prints versions, then `SELFTEST PASS`).
+Options: `--model large-v3` (default), `--language en` (default),
+`--selftest` (ignores the other args; generates a 4 s 440 Hz sine WAV, loads
+**both** models on CUDA, runs transcription + diarization, prints versions,
+then `SELFTEST PASS`), `--no-embeddings` (skip voice-embedding computation and
+name matching), `--speakers-file PATH` (override the speaker store location),
+`--match-threshold 0.60` (minimum cosine similarity to use an enrolled name).
+
+## Speaker store (enrollment)
+
+Named voices are stored in `%LOCALAPPDATA%\TeamsRecorder\speakers.json`
+(override with `--speakers-file`), created on first write; a missing file
+means "no known speakers":
+
+```json
+{
+  "version": 1,
+  "speakers": [
+    { "name": "Sean", "embeddings": [["...256 floats..."], "..."], "updated": "2026-02-15T10:20:00" }
+  ]
+}
+```
+
+At most **5** embeddings are kept per name (oldest dropped first), so a voice
+that drifts is gradually re-enrolled.
+
+### Matching
+
+During normal transcription, each diarized speaker's embedding is compared
+(cosine similarity) against every stored embedding. The best (name, score) per
+speaker is resolved **greedily by descending score** so two diarized speakers
+never resolve to the same name — the loser falls back to `Speaker N` (numbering
+counts only the unnamed ones, in order of first appearance). Names above the
+threshold replace the `Speaker N` label in `utterances`, `speakers`,
+`speaker_map` and `transcript.md`.
+
+### Rename / enroll (no GPU needed)
+
+```powershell
+.\sidecar\.venv\Scripts\python.exe sidecar\transcribe.py rename `
+    --session .\sessions `<dir>` `
+    --assign "Speaker 1=Sean" `
+    --assign "Speaker 2=Kevin" `
+    [--no-enroll]            # skip appending embeddings to the store
+    [--speakers-file PATH]
+```
+
+Loads `<session>\transcript.json`, renames each `OldLabel` to `NewName`
+everywhere (`speakers`, `utterances[].speaker`, `speaker_map[].label/name`),
+appends that speaker's `embedding` to the store under the new name (unless
+`--no-enroll`), rewrites `transcript.json` and regenerates `transcript.md`
+from the same writer used by normal mode. Exits 0/1 like the main mode.
+`rename` does not import torch/pyannote/faster-whisper, so it starts fast.
 
 ## Pipeline details
 
@@ -111,9 +185,15 @@ on CUDA, runs transcription + diarization, prints versions, then `SELFTEST PASS`
 4. Each loopback word is assigned to the turn with the greatest overlap
    (nearest turn midpoint when nothing overlaps); consecutive words with the
    same speaker are merged into one utterance.
-5. Both streams are merged and sorted by start time; JSON + Markdown are written.
-6. GPU memory is released at the end (`del model; torch.cuda.empty_cache()`).
-7. WAVs shorter than 1 s are skipped gracefully and noted in the JSON.
+5. One embedding per diarized speaker is computed with
+   `pyannote/wespeaker-voxceleb-resnet34-LM` via `Inference(window="whole")`
+   (turns ≥ 0.5 s concatenated, up to 20 s; output L2-normalized → 256-D),
+   then matched against the speaker store (cosine similarity, greedy
+   assignment, threshold `--match-threshold`); `--no-embeddings` skips this.
+6. Both streams are merged and sorted by start time; JSON (incl. `speaker_map`)
+   + Markdown are written by one shared writer (also used by `rename`).
+7. GPU memory is released at the end (`del model; torch.cuda.empty_cache()`).
+8. WAVs shorter than 1 s are skipped gracefully and noted in the JSON.
 
 ## Blackwell (sm_120) caveats
 
