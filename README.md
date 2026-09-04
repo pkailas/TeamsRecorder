@@ -1,4 +1,4 @@
-# TeamsRecorder
+﻿# TeamsRecorder
 
 A Windows tray app that records the audio of a Microsoft Teams meeting on this
 PC as **two WAV files**:
@@ -126,3 +126,6 @@ runtime as two directories above the executable when running from `bin\`
   transcript contains unnamed speakers, the **Name speakers** dialog opens
   instead (see [Naming speakers](#naming-speakers)).
 - Only one instance runs at a time (named mutex `Global\TeamsRecorder`).
+
+- **Use a headset.** With open speakers the microphone also hears the far end, so the "Paul" track duplicates what everyone else said. A headset (or any mic that doesn't pick up the speakers) keeps the two tracks clean.
+- Verified live on 2026-09-04: hotkey → two-track capture → sidecar → diarized transcript → naming dialog, end to end on BEAST.
