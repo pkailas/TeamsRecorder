@@ -28,6 +28,31 @@ Python dependencies from `sidecar/requirements.txt`, then runs
 Per-recording behaviour, output formats, and Blackwell caveats are documented
 in [sidecar/README.md](sidecar/README.md).
 
+## Naming speakers
+
+After a recording stops, the sidecar diarizes everyone who spoke and writes a
+transcript. Known voices are matched automatically against the enrolled speaker
+store (see the "Speaker store" section of [sidecar/README.md](sidecar/README.md));
+speakers with no match are labelled `Speaker 1`, `Speaker 2`, …
+
+When transcription finishes and the transcript has unnamed speakers, the app
+opens a **Name speakers** dialog: each row shows the speaker's label, how long
+they talked, a sample of what they said, and a name box with autocomplete from
+the enrolled names (the sidecar's best guess, if any, appears as grey
+placeholder text). Entering a name and saving:
+
+1. Renames the speaker throughout `transcript.json` and `transcript.md` by
+   running the sidecar's `rename` subcommand (no GPU needed), and
+2. Enrolls the speaker's voice in `speakers.json`, so next time the same person
+   is recognized automatically.
+
+If every speaker was already recognized, a "Transcript ready" balloon is shown
+instead. The right-click menu also has:
+
+- **Name speakers in last recording…** — reopens the dialog for the most recent
+  session (disabled until a session has a transcript).
+- **Open last transcript** — opens `transcript.md` in the default app.
+
 ## Build
 
 Requires the .NET 10 SDK and Windows.
@@ -97,5 +122,7 @@ runtime as two directories above the executable when running from `bin\`
 - **>2 channel capture:** a >2-channel capture format takes channel 0 via
   `MultiplexingSampleProvider` instead of mixing everything into mono.
 - The sidecar runs fire-and-forget; a balloon tip reports "Transcript ready"
-  (exit 0) or "Transcription failed — see sidecar.log" (non-zero).
+  (exit 0) or "Transcription failed — see sidecar.log" (non-zero). When the
+  transcript contains unnamed speakers, the **Name speakers** dialog opens
+  instead (see [Naming speakers](#naming-speakers)).
 - Only one instance runs at a time (named mutex `Global\TeamsRecorder`).

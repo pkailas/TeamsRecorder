@@ -106,4 +106,80 @@ public static class SidecarRunner
         Task.Run(() => onFinished(-1, startError));
         return false;
     }
+
+    /// <summary>
+    /// Runs the sidecar's <c>rename</c> subcommand on a background thread:
+    /// <c>PythonExe SidecarScript rename --session &lt;folder&gt; --assign "Label=Name" ...</c>
+    /// stdout/stderr are appended to <c>&lt;folder&gt;\sidecar.log</c>. Returns the
+    /// exit code; -1 if the process could not be started or crashed.
+    /// </summary>
+    public static Task<int> RenameAsync(
+        Settings s,
+        string sessionFolder,
+        IEnumerable<(string label, string name)> assignments)
+    {
+        return Task.Run(() =>
+        {
+            Process? process = null;
+            StreamWriter? stdout = null;
+            StreamWriter? stderr = null;
+            try
+            {
+                var logPath = Path.Combine(sessionFolder, "sidecar.log");
+                stdout = new StreamWriter(logPath, append: true) { AutoFlush = true };
+                stderr = new StreamWriter(logPath, append: true) { AutoFlush = true };
+                stdout.WriteLine($"\n--- rename {DateTime.Now:yyyy-MM-dd HH:mm:ss} ---");
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = s.PythonExe,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetDirectoryName(s.SidecarScript) ?? sessionFolder,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                psi.ArgumentList.Add(s.SidecarScript);
+                psi.ArgumentList.Add("rename");
+                psi.ArgumentList.Add("--session");
+                psi.ArgumentList.Add(sessionFolder);
+                foreach (var (label, name) in assignments)
+                {
+                    psi.ArgumentList.Add("--assign");
+                    psi.ArgumentList.Add($"{label}={name}");
+                }
+
+                process = new Process { StartInfo = psi };
+                process.OutputDataReceived += (_, e) =>
+                {
+                    if (e.Data is not null)
+                        stdout.WriteLine(e.Data);
+                };
+                process.ErrorDataReceived += (_, e) =>
+                {
+                    if (e.Data is not null)
+                        stderr.WriteLine(e.Data);
+                };
+
+                if (!process.Start())
+                    return -1;
+
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                process.WaitForExit();
+                return process.ExitCode;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"TeamsRecorder: rename failed ({ex.Message}).");
+                return -1;
+            }
+            finally
+            {
+                stdout?.Dispose();
+                stderr?.Dispose();
+                process?.Dispose();
+            }
+        });
+    }
 }
