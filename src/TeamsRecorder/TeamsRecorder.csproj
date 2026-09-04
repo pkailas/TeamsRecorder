@@ -9,7 +9,13 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>TeamsRecorder</RootNamespace>
     <AssemblyName>TeamsRecorder</AssemblyName>
+    <ApplicationIcon>..\..\assets\TeamsRecorder.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\assets\TeamsRecorder.ico" LogicalName="TeamsRecorder.rec.ico" />
+    <EmbeddedResource Include="..\..\assets\TeamsRecorder-idle.ico" LogicalName="TeamsRecorder.idle.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />

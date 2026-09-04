@@ -20,7 +20,6 @@ public sealed class TrayContext : ApplicationContext
     private readonly ToolStripMenuItem _openTranscriptItem;
     private readonly ToolStripMenuItem _startWithWindowsItem;
     private DateTime _startedAt;
-    private Icon? _recordingIcon;
 
     /// <summary>
     /// The SynchronizationContext of the UI thread (set in the constructor while
@@ -32,7 +31,16 @@ public sealed class TrayContext : ApplicationContext
     private string? _lastSessionFolder;
     private TranscriptInfo? _lastTranscript;
 
-    private static readonly Icon IdleIcon = SystemIcons.Application;
+    // Both icons are embedded from assets\ (see csproj). Idle = grey dot, recording = red dot.
+    private static readonly Icon IdleIcon = LoadEmbeddedIcon("TeamsRecorder.idle.ico");
+    private static readonly Icon RecordingIcon = LoadEmbeddedIcon("TeamsRecorder.rec.ico");
+
+    private static Icon LoadEmbeddedIcon(string name)
+    {
+        using var stream = typeof(TrayContext).Assembly.GetManifestResourceStream(name)
+            ?? throw new InvalidOperationException($"Embedded icon '{name}' not found.");
+        return new Icon(stream, 16, 16);
+    }
 
     public TrayContext()
     {
@@ -272,7 +280,6 @@ public sealed class TrayContext : ApplicationContext
         _recorder.Dispose();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
-        _recordingIcon?.Dispose();
         Application.Exit();
     }
 
@@ -289,36 +296,8 @@ public sealed class TrayContext : ApplicationContext
         }
     }
 
-    /// <summary>
-    /// Idle icon = SystemIcons.Application. While recording, draw a 16×16 red
-    /// circle at runtime so no icon resource files are needed.
-    /// </summary>
-    private void UpdateIcon(bool recording)
-    {
-        _recordingIcon?.Dispose();
-        _recordingIcon = null;
-
-        if (recording)
-        {
-            using var bmp = new Bitmap(16, 16);
-            using (var g = Graphics.FromImage(bmp))
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.Clear(Color.Transparent);
-                using var brush = new SolidBrush(Color.Red);
-                g.FillEllipse(brush, 1, 1, 14, 14);
-            }
-
-            // The bitmap must stay alive for the lifetime of the icon handle.
-            var hIcon = bmp.GetHicon();
-            _recordingIcon = Icon.FromHandle(hIcon);
-            _notifyIcon.Icon = _recordingIcon;
-        }
-        else
-        {
-            _notifyIcon.Icon = IdleIcon;
-        }
-    }
+    /// <summary>Swap the tray icon between the idle (grey dot) and recording (red dot) variants.</summary>
+    private void UpdateIcon(bool recording) => _notifyIcon.Icon = recording ? RecordingIcon : IdleIcon;
 
     private void ShowBalloon(string title, string message)
     {
