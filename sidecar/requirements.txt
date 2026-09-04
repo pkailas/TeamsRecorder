@@ -1,0 +1,21 @@
+# TeamsRecorder transcription sidecar
+# torch/torchaudio are installed separately from the cu128 wheel index by setup.ps1
+# (pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128).
+# Everything below goes into the same venv.
+
+# NVIDIA runtime DLLs (cuBLAS 12 + cuDNN 9) — required by ctranslate2's CUDA build.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# ASR (pulls in ctranslate2 >= 4.5).
+faster-whisper
+
+# Speaker diarization (4.x).
+pyannote.audio
+
+# Preload WAVs into memory for pyannote (its torchcodec decoder has no FFmpeg
+# DLLs on this Windows setup; in-memory waveforms bypass file decoding).
+soundfile
+
+# HF client (pin to a recent stable line; pyannote.audio needs huggingface_hub>=0.16).
+huggingface_hub

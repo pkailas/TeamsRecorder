@@ -10,6 +10,24 @@ Both files are written as **16 kHz / 16-bit / mono** WAV. When recording stops,
 the app launches a Python sidecar (`sidecar/transcribe.py`) to transcribe them.
 The sidecar is a separate component — this repo only launches it.
 
+## Sidecar setup
+
+The transcription sidecar lives in `sidecar/` (faster-whisper ASR + pyannote
+speaker diarization, running on the NVIDIA GPU). One-time setup:
+
+```powershell
+.\sidecar\setup.ps1
+```
+
+This is idempotent: it creates `sidecar\.venv`, installs the CUDA torch build
+(verified to support the RTX PRO 6000 Blackwell `sm_120`), the rest of the
+Python dependencies from `sidecar/requirements.txt`, then runs
+`transcribe.py --selftest` (must print `SELFTEST PASS`). Model weights go to
+`G:\models` (see `HF_TOKEN` user env var and `sidecar/README.md`).
+
+Per-recording behaviour, output formats, and Blackwell caveats are documented
+in [sidecar/README.md](sidecar/README.md).
+
 ## Build
 
 Requires the .NET 10 SDK and Windows.
