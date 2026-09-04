@@ -27,8 +27,10 @@ public static class SidecarRunner
         try
         {
             var logPath = Path.Combine(sessionFolder, "sidecar.log");
-            var stdout = new StreamWriter(logPath, append: false) { AutoFlush = true };
-            var stderr = new StreamWriter(logPath, append: true) { AutoFlush = true };
+            // One thread-safe writer shared by both streams: opening the same file
+            // twice throws "being used by another process" and the sidecar never launches.
+            var stdout = TextWriter.Synchronized(new StreamWriter(logPath, append: false) { AutoFlush = true });
+            var stderr = stdout;
 
             var psi = new ProcessStartInfo
             {
@@ -88,7 +90,6 @@ public static class SidecarRunner
                     finally
                     {
                         stdout.Dispose();
-                        stderr.Dispose();
                         procRef.Dispose();
                     }
                     onFinished(exitCode, errorMessage);
@@ -121,13 +122,14 @@ public static class SidecarRunner
         return Task.Run(() =>
         {
             Process? process = null;
-            StreamWriter? stdout = null;
-            StreamWriter? stderr = null;
+            TextWriter? stdout = null;
+            TextWriter? stderr = null;
             try
             {
                 var logPath = Path.Combine(sessionFolder, "sidecar.log");
-                stdout = new StreamWriter(logPath, append: true) { AutoFlush = true };
-                stderr = new StreamWriter(logPath, append: true) { AutoFlush = true };
+                // Single shared writer (see TryStart).
+                stdout = TextWriter.Synchronized(new StreamWriter(logPath, append: true) { AutoFlush = true });
+                stderr = stdout;
                 stdout.WriteLine($"\n--- rename {DateTime.Now:yyyy-MM-dd HH:mm:ss} ---");
 
                 var psi = new ProcessStartInfo
@@ -177,7 +179,6 @@ public static class SidecarRunner
             finally
             {
                 stdout?.Dispose();
-                stderr?.Dispose();
                 process?.Dispose();
             }
         });

@@ -182,6 +182,10 @@ public sealed class Recorder : IDisposable
         {
             DiscardOnBufferOverflow = true,
             BufferDuration = TimeSpan.FromSeconds(30),
+            // Default ReadFully=true pads every Read() with silence to fill the
+            // buffer, so the writer loop never sees 0 bytes and writes gigabytes
+            // of zeros. Return only what has actually been captured.
+            ReadFully = false,
         };
         var bufferedRef = buffered; // lambda cannot capture an out parameter
         capture.DataAvailable += (_, e) => bufferedRef.AddSamples(e.Buffer, 0, e.BytesRecorded);

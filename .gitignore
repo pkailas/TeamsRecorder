@@ -20,3 +20,6 @@ sidecar/.venv/
 # agent / tooling state
 .devmind/
 MEMORY.md
+
+sidecar/*.log
+sidecar/__pycache__/
