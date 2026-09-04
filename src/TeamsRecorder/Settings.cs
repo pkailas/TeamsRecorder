@@ -91,12 +91,14 @@ public sealed class Settings
     /// </summary>
     public static string ResolveRepoRoot()
     {
+        // Walk up from the exe location until we find the repo root, identified
+        // by sidecar\transcribe.py. Handles bin\Debug\net10.0-windows\, publish
+        // folders, or the exe sitting at the root. Falls back to BaseDirectory.
         var baseDir = new DirectoryInfo(AppContext.BaseDirectory);
-        if (baseDir.Parent is { Name: "bin" } binDir)
+        for (var dir = baseDir; dir is not null; dir = dir.Parent)
         {
-            // <repo>\src\TeamsRecorder\bin  ->  <repo>\src  ->  <repo>
-            if (binDir.Parent is { Name: "src" })
-                return binDir.Parent.Parent!.FullName;
+            if (File.Exists(Path.Combine(dir.FullName, "sidecar", "transcribe.py")))
+                return dir.FullName;
         }
         return baseDir.FullName;
     }
