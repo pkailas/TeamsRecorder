@@ -1,0 +1,5 @@
+<solution>
+  <Folder Name="/src/">
+    <Project Path="src/TeamsRecorder/TeamsRecorder.csproj" />
+  </Folder>
+</solution>

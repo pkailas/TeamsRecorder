@@ -1,0 +1,22 @@
+## .NET / Visual Studio
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.sln.docstates
+*.userprefs
+*.DotSettings.user
+TestResults/
+Artifacts/
+publish/
+
+## Rider
+.idea/
+
+# sidecar virtual environment
+sidecar/.venv/
+
+# agent / tooling state
+.devmind/
+MEMORY.md

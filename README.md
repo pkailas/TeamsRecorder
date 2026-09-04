@@ -1,0 +1,83 @@
+# TeamsRecorder
+
+A Windows tray app that records the audio of a Microsoft Teams meeting on this
+PC as **two WAV files**:
+
+- `mic.wav` — the microphone (you, the local user)
+- `loopback.wav` — system loopback (everyone else, i.e. what is playing)
+
+Both files are written as **16 kHz / 16-bit / mono** WAV. When recording stops,
+the app launches a Python sidecar (`sidecar/transcribe.py`) to transcribe them.
+The sidecar is a separate component — this repo only launches it.
+
+## Build
+
+Requires the .NET 10 SDK and Windows.
+
+```powershell
+dotnet build
+# or run directly:
+dotnet run --project src\TeamsRecorder
+```
+
+The only NuGet dependency is `NAudio` 2.2.1.
+
+## Run
+
+- An icon appears in the notification area (system tray).
+- **Double-click** the icon, or use the right-click menu:
+  - **Start recording** / **Stop recording** — or press the hotkey.
+  - **Open recordings folder** — opens Explorer at the output folder.
+  - **Settings…** — opens the settings JSON in Notepad.
+  - **Exit** — stops any in-progress recording and quits.
+- Global hotkey (default **Ctrl+Alt+R**) toggles start/stop from anywhere.
+- While recording, the tray icon turns into a red circle and the tooltip shows
+  elapsed time. A balloon tip is shown on start and on stop.
+
+## Where files go
+
+Each recording creates one session folder:
+
+```
+<OutputFolder>\<yyyy-MM-dd_HHmm>\
+    mic.wav
+    loopback.wav
+    sidecar.log        # after transcription (stdout/stderr of the sidecar)
+```
+
+Default `OutputFolder` is `%USERPROFILE%\Recordings\Teams`.
+
+## Settings
+
+The settings file lives at `%LOCALAPPDATA%\TeamsRecorder\settings.json`
+(created with defaults on first run). Edit it via **Settings…** (Notepad).
+
+| Field                | Default                                             | Meaning                                                        |
+| -------------------- | --------------------------------------------------- | -------------------------------------------------------------- |
+| `OutputFolder`       | `%USERPROFILE%\Recordings\Teams`                    | Root folder for session sub-folders.                            |
+| `PythonExe`          | `<repo>\sidecar\.venv\Scripts\python.exe`           | Python interpreter used to launch the sidecar.                  |
+| `SidecarScript`      | `<repo>\sidecar\transcribe.py`                      | The transcription script.                                       |
+| `Hotkey`             | `Ctrl+Alt+R`                                        | Global toggle hotkey (`Ctrl+Alt+Shift+Win+<key>`).              |
+| `MicDeviceName`      | `null`                                              | Substring match on the capture device's FriendlyName; null = default Communications capture device. |
+| `LoopbackDeviceName` | `null`                                              | Substring match on the render device's FriendlyName; null = default render device. |
+| `AutoTranscribe`     | `true`                                              | Launch the sidecar automatically after Stop.                    |
+
+`<repo>` is the directory containing `src\` and `sidecar\` — resolved at
+runtime as two directories above the executable when running from `bin\`
+(see `Settings.ResolveRepoRoot`).
+
+## Notes & gotchas
+
+- **Loopback silence:** `WasapiLoopbackCapture` delivers no audio callbacks
+  while nothing is playing, which would make `loopback.wav` drift out of sync
+  with `mic.wav`. The recorder plays a silent stream on the same render device
+  for the whole session to force continuous loopback frames.
+- **Devices:** WASAPI shared-mode capture; the mic uses the default
+  *Communications* endpoint so it picks up Teams' echo-cancelling mic path.
+  Named-device settings are matched case-insensitively against
+  `MMDevice.FriendlyName` (contains match).
+- **>2 channel capture:** a >2-channel capture format takes channel 0 via
+  `MultiplexingSampleProvider` instead of mixing everything into mono.
+- The sidecar runs fire-and-forget; a balloon tip reports "Transcript ready"
+  (exit 0) or "Transcription failed — see sidecar.log" (non-zero).
+- Only one instance runs at a time (named mutex `Global\TeamsRecorder`).
