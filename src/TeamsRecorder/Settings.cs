@@ -95,6 +95,17 @@ public sealed class Settings
         // by sidecar\transcribe.py. Handles bin\Debug\net10.0-windows\, publish
         // folders, or the exe sitting at the root. Falls back to BaseDirectory.
         var baseDir = new DirectoryInfo(AppContext.BaseDirectory);
+
+        // A published copy (see publish.ps1) lives outside the repo; it carries a
+        // "repo.path" file next to the exe pointing back at the checkout.
+        var pointer = Path.Combine(baseDir.FullName, "repo.path");
+        if (File.Exists(pointer))
+        {
+            var root = File.ReadAllText(pointer).Trim();
+            if (File.Exists(Path.Combine(root, "sidecar", "transcribe.py")))
+                return root;
+        }
+
         for (var dir = baseDir; dir is not null; dir = dir.Parent)
         {
             if (File.Exists(Path.Combine(dir.FullName, "sidecar", "transcribe.py")))

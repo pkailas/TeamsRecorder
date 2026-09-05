@@ -53,6 +53,16 @@ instead. The right-click menu also has:
   session (disabled until a session has a transcript).
 - **Open last transcript** — opens `transcript.md` in the default app.
 
+## Publish (recommended way to run it)
+
+```powershell
+.\publish.ps1
+```
+
+Publishes a self-contained build to `%LOCALAPPDATA%\TeamsRecorder\app\`, stops any running
+instance, re-points the Startup shortcut, and relaunches. The published copy finds the sidecar
+through `repo.path` next to the exe, so the repo can be rebuilt freely while the app runs.
+
 ## Build
 
 Requires the .NET 10 SDK and Windows.
