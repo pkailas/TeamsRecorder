@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Drawing.Drawing2D;
 
 namespace TeamsRecorder;
 
@@ -17,6 +16,7 @@ public sealed class TrayContext : ApplicationContext
     private readonly NotifyIcon _notifyIcon;
     private readonly Settings _settings;
     private readonly ToolStripMenuItem _nameSpeakersItem;
+    private readonly ToolStripMenuItem _retranscribeItem;
     private readonly ToolStripMenuItem _openTranscriptItem;
     private readonly ToolStripMenuItem _startWithWindowsItem;
     private DateTime _startedAt;
@@ -30,6 +30,9 @@ public sealed class TrayContext : ApplicationContext
     /// <summary>Most recent session that reached a finished transcription.</summary>
     private string? _lastSessionFolder;
     private TranscriptInfo? _lastTranscript;
+
+    /// <summary>True while a sidecar transcription is running (auto or manual).</summary>
+    private bool _transcriptionRunning;
 
     // Both icons are embedded from assets\ (see csproj). Idle = grey dot, recording = red dot.
     private static readonly Icon IdleIcon = LoadEmbeddedIcon("TeamsRecorder.idle.ico");
@@ -59,6 +62,12 @@ public sealed class TrayContext : ApplicationContext
         };
         _nameSpeakersItem.Click += (_, _) => NameSpeakersInLastRecording();
 
+        _retranscribeItem = new ToolStripMenuItem("Re-transcribe last recording")
+        {
+            Enabled = false,
+        };
+        _retranscribeItem.Click += (_, _) => RetranscribeLastRecording();
+
         _openTranscriptItem = new ToolStripMenuItem("Open last transcript")
         {
             Enabled = false,
@@ -87,6 +96,7 @@ public sealed class TrayContext : ApplicationContext
         menu.Items.Add(_stopItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_nameSpeakersItem);
+        menu.Items.Add(_retranscribeItem);
         menu.Items.Add(_openTranscriptItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(openFolderItem);
@@ -120,6 +130,16 @@ public sealed class TrayContext : ApplicationContext
         {
             if (hotkeyError is not null)
                 MessageBox.Show(hotkeyError, "Teams Recorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        // --- Restore the most recent session across app restarts/crashes ---
+        _lastSessionFolder = FindLastSessionFolder(_settings.OutputFolder);
+        if (_lastSessionFolder is { } lastFolder)
+        {
+            _lastTranscript = TranscriptInfo.Load(lastFolder);
+            _nameSpeakersItem.Enabled = _lastTranscript is { } t && t.Unnamed.Any();
+            _retranscribeItem.Enabled = true;
+            _openTranscriptItem.Enabled = File.Exists(Path.Combine(lastFolder, "transcript.md"));
         }
 
         // --- 1 s timer for the tooltip ---
@@ -176,14 +196,7 @@ public sealed class TrayContext : ApplicationContext
 
             if (_settings.AutoTranscribe && _recorder.SessionFolder is { } folder)
             {
-                SidecarRunner.TryStart(_settings, micWav, loopbackWav, folder, (exitCode, error) =>
-                {
-                    if (exitCode == 0)
-                        OnTranscriptionFinished(folder, error);
-                    else
-                        ShowBalloon("Transcription failed — see sidecar.log",
-                            error ?? $"Exit code {exitCode}");
-                });
+                StartTranscription(micWav, loopbackWav, folder);
             }
         }
         catch (Exception ex)
@@ -307,6 +320,58 @@ public sealed class TrayContext : ApplicationContext
     }
 
     /// <summary>
+    /// Starts the sidecar transcription for <paramref name="folder"/> and tracks the
+    /// run with <see cref="_transcriptionRunning"/> (which disables the
+    /// "Re-transcribe last recording" menu item until the completion callback fires).
+    /// Used by both the post-recording flow and the manual re-transcribe item.
+    /// </summary>
+    private void StartTranscription(string micWav, string loopbackWav, string folder)
+    {
+        _transcriptionRunning = true;
+        _retranscribeItem.Enabled = false;
+        ShowBalloon("Transcribing…", folder);
+        SidecarRunner.TryStart(_settings, micWav, loopbackWav, folder, (exitCode, error) =>
+        {
+            if (exitCode == 0)
+                OnTranscriptionFinished(folder, error);
+            else
+            {
+                _uiContext?.Post(_ =>
+                {
+                    _transcriptionRunning = false;
+                    _retranscribeItem.Enabled = _lastSessionFolder is not null;
+                    ShowBalloon("Transcription failed — see sidecar.log",
+                        error ?? $"Exit code {exitCode}");
+                }, null);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Finds the newest subfolder of <paramref name="outputFolder"/> that contains
+    /// both <c>mic.wav</c> and <c>loopback.wav</c>, or null if none exists.
+    /// Used at startup to restore the "last session" after an app restart or crash.
+    /// </summary>
+    private static string? FindLastSessionFolder(string outputFolder)
+    {
+        try
+        {
+            if (!Directory.Exists(outputFolder))
+                return null;
+
+            return Directory.GetDirectories(outputFolder)
+                .Where(d => File.Exists(Path.Combine(d, "mic.wav"))
+                          && File.Exists(Path.Combine(d, "loopback.wav")))
+                .OrderByDescending(Directory.GetLastWriteTime)
+                .FirstOrDefault();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Sidecar finished with exit 0 (invoked on a thread-pool thread by
     /// <see cref="SidecarRunner.TryStart"/>). Loads the transcript and either
     /// opens the speaker-naming dialog (unnamed speakers present) or balloons
@@ -329,7 +394,9 @@ public sealed class TrayContext : ApplicationContext
         _lastTranscript = info;
         _uiContext?.Post(_ =>
         {
+            _transcriptionRunning = false;
             _nameSpeakersItem.Enabled = info.Unnamed.Any();
+            _retranscribeItem.Enabled = true;
             var md = Path.Combine(sessionFolder, "transcript.md");
             _openTranscriptItem.Enabled = File.Exists(md);
         }, null);
@@ -422,6 +489,24 @@ public sealed class TrayContext : ApplicationContext
                 }
             }, null);
         });
+    }
+
+    /// <summary>Re-runs the sidecar transcription on the last session's WAV files (context menu).</summary>
+    private void RetranscribeLastRecording()
+    {
+        if (_lastSessionFolder is not { } folder)
+            return;
+
+        if (_transcriptionRunning)
+        {
+            ShowBalloon("Transcription already running", "Please wait for it to finish.");
+            return;
+        }
+
+        StartTranscription(
+            Path.Combine(folder, "mic.wav"),
+            Path.Combine(folder, "loopback.wav"),
+            folder);
     }
 
     /// <summary>Opens the most recent transcript.md with the default app (context menu).</summary>

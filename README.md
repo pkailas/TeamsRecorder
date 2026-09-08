@@ -51,6 +51,10 @@ instead. The right-click menu also has:
 
 - **Name speakers in last recording…** — reopens the dialog for the most recent
   session (disabled until a session has a transcript).
+- **Re-transcribe last recording** — re-runs the sidecar on the last session's
+  WAV files (enabled whenever a session with `mic.wav` and `loopback.wav`
+  exists, including after an app restart; disabled while a transcription is
+  running).
 - **Open last transcript** — opens `transcript.md` in the default app.
 
 ## Publish (recommended way to run it)
