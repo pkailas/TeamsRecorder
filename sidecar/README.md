@@ -13,6 +13,10 @@ Transcribes the two WAV files recorded by the tray app:
   with a score ≥ the match threshold (default 0.60) are labelled with the
   enrolled name instead of `Speaker N`.
 
+  Because open speakers let the mic hear the far end, mic utterances are
+  checked against the loopback track and **speaker bleed is dropped** (see
+  *Speaker-bleed dedup* below). Disable with `--no-dedup`.
+
 Outputs (written into the session folder):
 
 - `transcript.json` — machine-readable:
@@ -40,6 +44,15 @@ Outputs (written into the session folder):
         "sample_text": "...longest utterance, ≤ 200 chars...",
         "embedding": [0.01, "...256 floats..."]
       }
+    ],
+    "mic_bleed_dropped": 37,
+    "mic_dropped": [
+      {
+        "start": 12.3,
+        "end": 15.8,
+        "text": "...mic utterance dropped as bleed...",
+        "matched_loopback_text": "...the overlapping loopback utterance(s) it matched..."
+      }
     ]
   }
   ```
@@ -50,6 +63,11 @@ Outputs (written into the session folder):
   `--no-embeddings` was used), `best_candidate` is the closest stored name
   even below the threshold, and `embedding` is the L2-normalized 256-D voice
   vector.
+
+  `mic_bleed_dropped` (count) and `mic_dropped` (audit list with
+  `start`/`end`/`text`/`matched_loopback_text` for each dropped mic utterance)
+  are only present in normal transcription mode — `mic_bleed_dropped` is `0`
+  when nothing was dropped, and `mic_dropped` is omitted when it is empty.
 
   A `notes` array is added when a track is skipped (e.g. WAV shorter than 1 s).
 
@@ -116,7 +134,11 @@ Options: `--model large-v3` (default), `--language en` (default),
 **both** models on CUDA, runs transcription + diarization, prints versions,
 then `SELFTEST PASS`), `--no-embeddings` (skip voice-embedding computation and
 name matching), `--speakers-file PATH` (override the speaker store location),
-`--match-threshold 0.60` (minimum cosine similarity to use an enrolled name).
+`--match-threshold 0.60` (minimum cosine similarity to use an enrolled name),
+`--no-dedup` (disable speaker-bleed dedup), `--dedup-threshold 0.6` (token-
+overlap threshold for dropping a mic utterance as bleed), `--dedup-window 2.0`
+(seconds of time window around each mic utterance when searching for
+overlapping loopback audio).
 
 ## Speaker store (enrollment)
 
@@ -190,11 +212,29 @@ from the same writer used by normal mode. Exits 0/1 like the main mode.
    (turns ≥ 0.5 s concatenated, up to 20 s; output L2-normalized → 256-D),
    then matched against the speaker store (cosine similarity, greedy
    assignment, threshold `--match-threshold`); `--no-embeddings` skips this.
-6. Both streams are merged and sorted by start time; JSON (incl. `speaker_map`)
-   + Markdown are written by one shared writer (also used by `rename`).
-7. GPU memory is released at the end (`del model; torch.cuda.empty_cache()`).
-8. WAVs shorter than 1 s are skipped gracefully and noted in the JSON.
+6. Speaker-bleed dedup (on by default; `--no-dedup` to disable): each mic
+   utterance is compared against loopback utterances whose time span overlaps
+   `[start − window, end + window]` (`--dedup-window`, default 2.0 s). Text is
+   normalised (lowercase, punctuation stripped, tokenised); a mic utterance is
+   dropped as bleed if its token-set **containment** `|M∩L|/|M|` or **Jaccard**
+   `|M∩L|/|M∪L|` against the union of the overlapping loopback words is ≥
+   `--dedup-threshold` (default 0.6). Containment handles mic utterances that
+   are fragments of longer loopback ones. Short interjections (< 3 words with
+   no overlapping loopback audio) are always kept. Dropped utterances are
+   recorded in `mic_dropped` (with `matched_loopback_text`) and counted in
+   `mic_bleed_dropped` in `transcript.json` for auditing.
+7. Both streams are merged and sorted by start time; JSON (incl.
+   `speaker_map`) + Markdown are written by one shared writer (also used by
+   `rename`).
+8. GPU memory is released at the end (`del model; torch.cuda.empty_cache()`).
+9. WAVs shorter than 1 s are skipped gracefully and noted in the JSON.
 
+Progress is logged to stdout (→ `sidecar.log`) as it happens: each WAV's
+duration after loading (`mic.wav: 47.9 min`), a position line every ~60 s of
+audio or every 200 segments (`mic.wav  12:00 / 47:54  (25%)  segs=310`),
+per-track timing (`mic.wav done in 83.2s (310 segments)`), diarization and
+embedding elapsed seconds, and a final summary
+(`Total 214.6s for 47.9 min audio (13.4x realtime)`).
 ## Blackwell (sm_120) caveats
 
 - **Do NOT use `compute_type="int8"` or `"int8_float16"`** — ctranslate2's cuBLAS

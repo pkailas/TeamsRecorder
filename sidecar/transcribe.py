@@ -22,17 +22,17 @@ Rename / enroll a speaker (no GPU needed):
 Self-test (acceptance check for GPU):
   python transcribe.py --selftest
 
-NOTE (Blackwell sm_120): ctranslate2 with compute_type="int8"/"int8_float16"
-crashes with CUBLAS_STATUS_NOT_SUPPORTED on this GPU. float16 is used instead.
+# NOTE (Blackwell sm_120): ctranslate2 with compute_type="int8"/"int8_float16"
+# crashes with CUBLAS_STATUS_NOT_SUPPORTED on this GPU. float16 is used instead.
 """
 from __future__ import annotations
-
 import argparse
 import glob
 import json
 import os
 import site
 import sys
+import time
 import traceback
 import wave
 from datetime import datetime
@@ -73,6 +73,14 @@ if sys.platform == "win32":
 
 import numpy as np  # noqa: E402  (imported after env setup on purpose)
 import soundfile as sf  # noqa: E402  (imported after env setup on purpose)
+
+# Line-buffer stdout/stderr so the C# app's sidecar.log shows lines as they
+# happen, even though the console is redirected to a file.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -209,6 +217,78 @@ def match_speakers(store: dict, candidates: list[tuple[str, np.ndarray]],
 
 
 # --------------------------------------------------------------------------
+# Speaker-bleed dedup
+# --------------------------------------------------------------------------
+import re
+import string
+
+_PUNCT_RE = re.compile("[" + re.escape(string.punctuation) + "]+")
+
+
+def _norm_words(text: str) -> list[str]:
+    """Lowercase, strip punctuation, split to words."""
+    return [w for w in _PUNCT_RE.sub(" ", text.lower()).split() if w]
+
+
+def dedupe_mic_bleed(mic_utts: list, loopback_utts: list, window: float = 2.0,
+                     threshold: float = 0.6) -> tuple[list, list]:
+    """
+    Drop mic utterances that are bleed (echo) of loopback audio.
+
+    mic.wav is the local user ("Paul"); loopback.wav is everyone else. When
+    the user has open speakers, the mic also hears the far end, so mic
+    utterances can duplicate loopback ones. The loopback side is never
+    contaminated (Teams does not play the local mic back), so loopback
+    utterances are ground truth for what the far end actually said.
+
+    For each mic utterance M, consider loopback utterances L whose time span
+    overlaps [M.start - window, M.end + window]. M is dropped if either:
+      - containment |M ∩ L| / |M| >= threshold  (M is a fragment of a longer
+        loopback utterance), or
+      - token-set Jaccard |M ∩ L| / |M ∪ L| >= threshold against the union of
+        the overlapping L words.
+    A mic utterance with < 3 words and no overlapping loopback audio at all
+    is always kept (short genuine interjections, e.g. "yes", "mm-hmm").
+
+    Returns (kept_mic_utts, dropped) where dropped entries carry
+    start/end/text/matched_loopback_text for auditing.
+    """
+    kept = []
+    dropped = []
+    for m in mic_utts:
+        m_words = set(_norm_words(m["text"]))
+        m_start, m_end = m["start"], m["end"]
+        overlap_words: set[str] = set()
+        overlap_texts: list[str] = []
+        for l in loopback_utts:
+            if l["end"] < m_start - window or l["start"] > m_end + window:
+                continue
+            overlap_words.update(_norm_words(l["text"]))
+            overlap_texts.append(l["text"].strip())
+        if len(m_words) < 3 and not overlap_texts:
+            kept.append(m)  # short interjection, nothing to compare against
+            continue
+        if not m_words or not overlap_words:
+            # No overlapping loopback text: not bleed, keep it.
+            kept.append(m)
+            continue
+        inter = m_words & overlap_words
+        union = m_words | overlap_words
+        containment = len(inter) / len(m_words)
+        jaccard = len(inter) / len(union)
+        if containment >= threshold or jaccard >= threshold:
+            dropped.append({
+                "start": m["start"],
+                "end": m["end"],
+                "text": m["text"],
+                "matched_loopback_text": " | ".join(overlap_texts)[:400],
+            })
+        else:
+            kept.append(m)
+    return kept, dropped
+
+
+# --------------------------------------------------------------------------
 # Word -> speaker assignment
 # --------------------------------------------------------------------------
 def assign_words_to_speakers(words, turns):
@@ -310,10 +390,12 @@ def write_transcript_md(out_dir: Path, result: dict) -> Path:
 
 
 def transcript_result(args, model_name: str, paul_utterances: list,
-                      loopback_utterances: list, diar_turns_out: list,
-                      speaker_map: list | None, notes: list,
-                      total_duration: float) -> dict:
-    """Assemble the transcript.json payload (shared by normal and rename modes)."""
+                       loopback_utterances: list, diar_turns_out: list,
+                       speaker_map: list | None, notes: list,
+                       total_duration: float,
+                       mic_bleed_dropped: int | None = None,
+                       mic_dropped: list | None = None) -> dict:
+    """Assemble the transcript.json payload (shared by normal and rename mode)."""
     all_utterances = paul_utterances + loopback_utterances
     all_utterances.sort(key=lambda u: u["start"])
 
@@ -335,6 +417,10 @@ def transcript_result(args, model_name: str, paul_utterances: list,
     }
     if speaker_map is not None:
         result["speaker_map"] = speaker_map
+    if mic_bleed_dropped is not None:
+        result["mic_bleed_dropped"] = mic_bleed_dropped
+        if mic_dropped:
+            result["mic_dropped"] = mic_dropped
     if notes:
         result["notes"] = notes
     return result
@@ -359,6 +445,7 @@ def run_transcription(args) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     notes = []
+    t_total_start = time.monotonic()
 
     # -- Load whisper -----------------------------------------------------
     model_name = args.model
@@ -376,8 +463,11 @@ def run_transcription(args) -> int:
         flaky depending on the FFmpeg DLLs present, and our WAVs are plain
         16-bit PCM anyway. The resample is a no-op (16 kHz -> 16 kHz).
         """
+        t0 = time.monotonic()
         log(f"Transcribing {path_str}")
         audio = load_wav_mono_float32(path_str, target_rate=16000)
+        dur = len(audio) / 16000.0
+        log(f"  {os.path.basename(path_str)}: {dur / 60.0:.1f} min")
         # initial_prompt nudges Whisper toward punctuated, cased output (it
         # sometimes drops both on flat or synthetic audio).
         seg_iter, _info = model.transcribe(
@@ -385,6 +475,7 @@ def run_transcription(args) -> int:
             word_timestamps=True, vad_filter=True,
             initial_prompt="Hello, welcome to the meeting. Let's get started.")
         segments = []
+        last_log_pos = -1e9
         for seg in seg_iter:
             segments.append({
                 "start": float(seg.start),
@@ -395,6 +486,18 @@ def run_transcription(args) -> int:
                     for w in (seg.words or [])
                 ],
             })
+            # Progress every ~60 s of audio position or every 200 segments,
+            # whichever first.
+            if (len(segments) % 200 == 0
+                    or seg.end - last_log_pos >= 60.0
+                    or seg.end >= dur):
+                pct = min(100.0, 100.0 * seg.end / dur) if dur > 0 else 0.0
+                log(f"  {os.path.basename(path_str)}  {fmt_hms(seg.end)} / "
+                    f"{fmt_hms(dur)}  ({pct:.0f}%)  segs={len(segments)}")
+                last_log_pos = seg.end
+        elapsed = time.monotonic() - t0
+        log(f"  {os.path.basename(path_str)} done in {elapsed:.1f}s "
+            f"({len(segments)} segments)")
         return segments
 
     # -- Mic (Paul) -------------------------------------------------------
@@ -444,14 +547,18 @@ def run_transcription(args) -> int:
             diar_pipe.to(torch.device("cuda"))
 
             log("Diarizing loopback.wav...")
+            t_diar = time.monotonic()
             turns, _raw = diarize(diar_pipe, loopback_path)
+            log(f"Diarization done in {time.monotonic() - t_diar:.1f}s")
             diar_turns_out = [{"start": s, "end": e, "label": l} for (s, e, l) in turns]
             log(f"Diarization: {len(turns)} turns: {turns[:5]}{'...' if len(turns) > 5 else ''}")
 
             # -- Speaker voice embeddings + name matching ------------------
             emb_by_label: dict[str, np.ndarray] = {}
             if turns and not args.no_embeddings:
+                t_emb = time.monotonic()
                 emb_by_label = compute_speaker_embeddings(loopback_path, 16000, turns)
+                log(f"Embeddings done in {time.monotonic() - t_emb:.1f}s")
 
             # Match against the enrolled speaker store (read-only here).
             match = {}
@@ -547,6 +654,18 @@ def run_transcription(args) -> int:
     else:
         notes.append(f"loopback wav not found: {loopback_path}")
 
+    # -- Speaker-bleed dedup (drop mic utterances that echo the far end) --
+    mic_bleed_dropped = None
+    mic_dropped = []
+    if (not getattr(args, "no_dedup", False) and paul_utterances
+            and loopback_utterances):
+        paul_utterances, mic_dropped = dedupe_mic_bleed(
+            paul_utterances, loopback_utterances,
+            window=args.dedup_window, threshold=args.dedup_threshold)
+        mic_bleed_dropped = len(mic_dropped)
+        log(f"Bleed dedup: dropped {mic_bleed_dropped} of "
+            f"{mic_bleed_dropped + len(paul_utterances)} mic utterances")
+
     # -- Merge -------------------------------------------------------------
     total_duration = 0.0
     for p in (mic_path, loopback_path):
@@ -558,13 +677,18 @@ def run_transcription(args) -> int:
 
     result = transcript_result(
         args, model_name, paul_utterances, loopback_utterances,
-        diar_turns_out, speaker_map, notes, total_duration)
+        diar_turns_out, speaker_map, notes, total_duration,
+        mic_bleed_dropped=mic_bleed_dropped, mic_dropped=mic_dropped)
 
     write_transcript(out_dir, result)
 
     # -- Free GPU ----------------------------------------------------------
     del model
     torch.cuda.empty_cache()
+    total_elapsed = time.monotonic() - t_total_start
+    rt = total_elapsed / total_duration if total_duration > 0 else 0.0
+    log(f"Total {total_elapsed:.1f}s for {total_duration / 60.0:.1f} min audio "
+        f"({rt:.1f}x realtime)")
     log(f"Done: {len(result['utterances'])} utterances.")
     return 0
 
@@ -798,6 +922,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--match-threshold", type=float, default=0.60,
                         help="Minimum cosine similarity to label a diarized "
                              "speaker with an enrolled name (default: 0.60).")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="Disable mic-bleed dedup (keep mic utterances "
+                             "that duplicate loopback audio).")
+    parser.add_argument("--dedup-threshold", type=float, default=0.6,
+                        help="Token-overlap threshold (containment or Jaccard) "
+                             "for dropping a mic utterance as bleed (default: 0.6).")
+    parser.add_argument("--dedup-window", type=float, default=2.0,
+                        help="Time window (s) around each mic utterance to "
+                             "search for overlapping loopback audio (default: 2.0).")
     sub = parser.add_subparsers(dest="command")
     rp = sub.add_parser(
         "rename",
