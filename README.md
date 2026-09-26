@@ -6,6 +6,9 @@ PC as **two WAV files**:
 - `mic.wav` — the microphone (you, the local user)
 - `loopback.wav` — system loopback (everyone else, i.e. what is playing)
 
+While recording, it also captures the **Teams meeting window** as `video.mp4`
+(see [Video](#video)).
+
 Both files are written as **16 kHz / 16-bit / mono** WAV. When recording stops,
 the app launches a Python sidecar (`sidecar/transcribe.py`) to transcribe them.
 The sidecar is a separate component — this repo only launches it.
@@ -77,7 +80,8 @@ dotnet build
 dotnet run --project src\TeamsRecorder
 ```
 
-The only NuGet dependency is `NAudio` 2.2.1.
+NuGet dependencies: `NAudio` 2.2.1, `Vortice.Direct3D11` 3.8.3, and
+`Vortice.DXGI` 3.8.3 (D3D11 readback for the video capture).
 
 ## Run
 
@@ -99,6 +103,9 @@ Each recording creates one session folder:
 <OutputFolder>\<yyyy-MM-dd_HHmm>\
     mic.wav
     loopback.wav
+    video.mp4          # while video capture is on (see below)
+    video.log          # video capture log (frames, re-attaches, ffmpeg exit code)
+    ffmpeg.log         # ffmpeg stderr for the video encode
     sidecar.log        # after transcription (stdout/stderr of the sidecar)
 ```
 
@@ -118,10 +125,35 @@ The settings file lives at `%LOCALAPPDATA%\TeamsRecorder\settings.json`
 | `MicDeviceName`      | `null`                                              | Substring match on the capture device's FriendlyName; null = default Communications capture device. |
 | `LoopbackDeviceName` | `null`                                              | Substring match on the render device's FriendlyName; null = default render device. |
 | `AutoTranscribe`     | `true`                                              | Launch the sidecar automatically after Stop.                    |
+| `VideoOn`            | `true`                                              | Capture the Teams meeting window as `video.mp4` during recording. |
+| `VideoFps`           | `5`                                                 | Frame rate for the video capture.                                |
+| `FfmpegExe`          | `G:\tools\ffmpeg\8.0.1\ffmpeg.exe`                  | ffmpeg executable used for the H.264 (nvenc) video encode.       |
 
 `<repo>` is the directory containing `src\` and `sidecar\` — resolved at
 runtime as two directories above the executable when running from `bin\`
 (see `Settings.ResolveRepoRoot`).
+
+## Video
+
+While a recording is running, the app also captures the **Teams meeting
+window** (the visible `ms-teams` window — the meeting pop-out if one is open,
+otherwise the largest visible Teams window) as a 1920×1080 H.264 MP4:
+
+- **Output:** `<session>\video.mp4` (video only; audio + captions muxing is a
+  separate step). The frame is scaled to fit the canvas with letterboxing —
+  nothing is clipped, so a window larger than 1080p is scaled down, not cut.
+- **Encoder:** `h264_nvenc` via the ffmpeg in `FfmpegExe` (needs a recent
+  NVIDIA driver); ffmpeg's stderr goes to `<session>\ffmpeg.log`.
+- **Frame rate:** `VideoFps` (default 5). If the window is static or
+  minimized, the last frame is re-sent so the video stays in sync with the
+  audio.
+- **Re-acquire:** if the captured window closes, the app polls every 2 s for a
+  new meeting window and re-attaches to the same encode; candidate window
+titles are logged to `<session>\recorder.log` on start.
+- **Silent no-op:** if no Teams window is found or ffmpeg is missing, a
+  balloon ("Video capture unavailable") is shown and **audio recording
+  continues** — video failures never affect the audio. All video events are
+  logged to `<session>\video.log`.
 
 ## Notes & gotchas
 

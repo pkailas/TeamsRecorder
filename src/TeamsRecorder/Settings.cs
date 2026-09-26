@@ -32,6 +32,15 @@ public sealed class Settings
     /// <summary>Whether to launch the Python sidecar automatically after Stop.</summary>
     public bool AutoTranscribe { get; set; } = true;
 
+    /// <summary>Whether to capture the Teams meeting window as video during recording.</summary>
+    public bool VideoOn { get; set; } = true;
+
+    /// <summary>Frame rate (fps) for the video capture. Default 5.</summary>
+    public int VideoFps { get; set; } = 5;
+
+    /// <summary>Path to the ffmpeg executable used for video encoding.</summary>
+    public string FfmpegExe { get; set; } = @"G:\tools\ffmpeg\8.0.1\ffmpeg.exe";
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,

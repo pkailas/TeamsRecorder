@@ -20,6 +20,7 @@ public sealed class TrayContext : ApplicationContext
     private readonly ToolStripMenuItem _openTranscriptItem;
     private readonly ToolStripMenuItem _startWithWindowsItem;
     private DateTime _startedAt;
+    private WindowCapture? _videoCapture;
 
     /// <summary>
     /// The SynchronizationContext of the UI thread (set in the constructor while
@@ -165,6 +166,10 @@ public sealed class TrayContext : ApplicationContext
         {
             _recorder.Start(_settings);
             _startedAt = DateTime.Now;
+
+            // --- Video capture (best-effort; audio is already running) ---
+            if (_settings.VideoOn)
+                StartVideoCapture();
             UpdateIcon(recording: true);
             _startItem.Enabled = false;
             _stopItem.Enabled = true;
@@ -180,6 +185,93 @@ public sealed class TrayContext : ApplicationContext
         }
     }
 
+    /// <summary>
+    /// Starts window video capture for the active session (best-effort). Any failure is
+    /// logged + reported with a balloon; audio recording is never affected.
+    /// </summary>
+    private void StartVideoCapture()
+    {
+        try
+        {
+            var sessionFolder = _recorder.SessionFolder
+                ?? throw new InvalidOperationException("No active session folder.");
+
+            var (hwnd, title, candidates) = WindowCapture.FindTeamsMeetingWindowCore();
+
+            // Log every candidate ms-teams window (title, hwnd, size) and which one was
+            // chosen. The meeting-window title pattern is unverified, so capture the real
+            // titles to recorder.log after the first live meeting.
+            foreach (var c in candidates)
+                LogVideo($"candidate ms-teams window: hwnd=0x{c.Hwnd:X} {c.W}x{c.H} \"{c.Title}\"", "recorder.log");
+            LogVideo($"chosen meeting window: hwnd=0x{hwnd:X} \"{title}\"", "recorder.log");
+
+            if (hwnd == IntPtr.Zero)
+            {
+                LogVideo("No ms-teams window found; video capture skipped.", "recorder.log");
+                ShowBalloon("Video capture unavailable", "No Teams window found. Audio recording continues.");
+                return;
+            }
+
+            var videoPath = Path.Combine(sessionFolder, "video.mp4");
+            _videoCapture = new WindowCapture();
+            _videoCapture.Log += (line) =>
+            {
+                Debug.WriteLine(line);
+                AppendVideoLog(sessionFolder, line, "video.log");
+            };
+            _videoCapture.Start(hwnd, videoPath, _settings);
+        }
+        catch (Exception ex)
+        {
+            // Video capture failed — audio recording continues.
+            Debug.WriteLine($"Video capture failed: {ex}");
+            try { _videoCapture?.Dispose(); } catch { /* best effort */ }
+            _videoCapture = null;
+            ShowBalloon("Video capture unavailable", ex.Message);
+        }
+    }
+
+    /// <summary>Stops + disposes the active video capture (no-op if none).</summary>
+    private void StopVideoCapture()
+    {
+        if (_videoCapture is null)
+            return;
+        try
+        {
+            _videoCapture.Stop();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Video stop failed: {ex.Message}");
+        }
+        finally
+        {
+            try { _videoCapture.Dispose(); } catch { /* best effort */ }
+            _videoCapture = null;
+        }
+    }
+
+    /// <summary>Writes a video log line to Debug and to &lt;session&gt;\&lt;fileName&gt;.</summary>
+    private void LogVideo(string line, string fileName = "video.log")
+    {
+        Debug.WriteLine(line);
+        if (_recorder.SessionFolder is { } folder)
+            AppendVideoLog(folder, line, fileName);
+    }
+
+    private static void AppendVideoLog(string sessionFolder, string line, string fileName)
+    {
+        try
+        {
+            File.AppendAllText(Path.Combine(sessionFolder, fileName),
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {line}{Environment.NewLine}");
+        }
+        catch
+        {
+            // Never let logging take down the capture.
+        }
+    }
+
     private void StopRecording()
     {
         if (!_recorder.IsRecording)
@@ -187,6 +279,9 @@ public sealed class TrayContext : ApplicationContext
 
         try
         {
+            // Stop video before audio so both end at the same wall-clock moment.
+            StopVideoCapture();
+
             var (micWav, loopbackWav) = _recorder.Stop();
             UpdateIcon(recording: false);
             _startItem.Enabled = true;
