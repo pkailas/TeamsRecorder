@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  :root {
+    --bg: #f6f7fb; --panel: #ffffff; --ink: #1f2330; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #4f46e5; --accent-soft: #eef2ff; --hit: #fef3c7;
+    --sp0: #4f46e5; --sp1: #059669; --sp2: #d97706; --sp3: #db2777; --sp4: #0891b2; --sp5: #7c3aed; --sp6: #65a30d; --sp7: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1117; --panel: #171a23; --ink: #e5e7eb; --muted: #9ca3af; --line: #2a2f3d; --accent: #818cf8; --accent-soft: #1e2140; --hit: #4a3a0a; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .app { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
+  header { display: flex; align-items: baseline; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  .main { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(360px, 1fr); min-height: 0; }
+  @media (max-width: 900px) { .main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } }
+  .video { padding: 16px; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  video { width: 100%; max-height: calc(100vh - 140px); background: #000; border-radius: 8px; }
+  .novideo { display: grid; place-items: center; aspect-ratio: 16/9; background: var(--panel); border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .controls button, .controls a { border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 6px 10px; border-radius: 6px; cursor: pointer; text-decoration: none; font-size: 13px; }
+  .controls button.on { background: var(--accent-soft); border-color: var(--accent); }
+  .side { display: grid; grid-template-rows: auto auto 1fr; min-height: 0; border-left: 1px solid var(--line); background: var(--panel); }
+  @media (max-width: 900px) { .side { border-left: 0; border-top: 1px solid var(--line); } }
+  .tools { padding: 10px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  .tools input { flex: 1; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
+  .tools .count { color: var(--muted); font-size: 12px; min-width: 60px; text-align: right; }
+  .speakers { padding: 8px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); cursor: pointer; font-size: 12px; user-select: none; }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .chip.off { opacity: .4; }
+  .chip .t { color: var(--muted); }
+  .lines { overflow-y: auto; padding: 6px 0; scroll-behavior: smooth; }
+  .line { display: grid; grid-template-columns: 62px 1fr; gap: 10px; padding: 6px 12px; cursor: pointer; border-left: 3px solid transparent; }
+  .line:hover { background: var(--accent-soft); }
+  .line.now { border-left-color: var(--accent); background: var(--accent-soft); }
+  .line.hide { display: none; }
+  .line .ts { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; padding-top: 2px; }
+  .line .who { font-weight: 600; margin-right: 6px; }
+  .line mark { background: var(--hit); color: inherit; padding: 0 1px; border-radius: 2px; }
+  footer { padding: 6px 12px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1 id="title"></h1>
+    <span class="meta" id="meta"></span>
+    <span class="spacer"></span>
+    <span class="meta">Space: play/pause · ←/→: ±5 s · J/K: prev/next line · / : search</span>
+  </header>
+  <div class="main">
+    <section class="video">
+      <div id="player"></div>
+      <div class="controls">
+        <button id="follow" class="on" title="Scroll transcript with playback">Follow</button>
+        <button id="copy" title="Copy visible transcript as text">Copy transcript</button>
+        <a id="dl-md" download>transcript.md</a>
+        <a id="dl-srt" download>transcript.srt</a>
+        <a id="dl-json" download>transcript.json</a>
+      </div>
+    </section>
+    <aside class="side">
+      <div class="tools">
+        <input id="q" type="search" placeholder="Search transcript…" autocomplete="off">
+        <span class="count" id="count"></span>
+      </div>
+      <div class="speakers" id="speakers"></div>
+      <div class="lines" id="lines"></div>
+    </aside>
+  </div>
+</div>
+<script>
+// The sidecar substitutes the two tokens below with the transcript JSON and the session file map.
+const DATA = __DATA__;
+const FILES = __FILES__;
+
+const $ = s => document.querySelector(s);
+const fmt = t => { t = Math.max(0, t|0); const h = (t/3600)|0, m = ((t%3600)/60)|0, s = t%60; return (h ? h + ':' : '') + String(m).padStart(h?2:1,'0') + ':' + String(s).padStart(2,'0'); };
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+// ---- header ----
+$('#title').textContent = DATA.title || document.title;
+const dur = DATA.duration_sec ? fmt(DATA.duration_sec) : '';
+$('#meta').textContent = [DATA.created ? new Date(DATA.created).toLocaleString() : '', dur, DATA.speakers ? DATA.speakers.length + ' speakers' : ''].filter(Boolean).join(' · ');
+
+// ---- video ----
+let video = null;
+if (FILES.video) {
+  video = document.createElement('video');
+  video.controls = true; video.preload = 'metadata'; video.src = FILES.video;
+  if (FILES.srt) { const tr = document.createElement('track'); tr.kind = 'subtitles'; tr.label = 'Transcript'; tr.srclang = 'en'; tr.src = FILES.vtt || ''; if (FILES.vtt) video.appendChild(tr); }
+  $('#player').appendChild(video);
+} else {
+  const d = document.createElement('div'); d.className = 'novideo'; d.textContent = 'No video for this meeting — transcript only.'; $('#player').appendChild(d);
+}
+$('#dl-md').href = FILES.md; $('#dl-srt').href = FILES.srt; $('#dl-json').href = FILES.json;
+
+// ---- speakers ----
+const speakers = [...new Set((DATA.utterances || []).map(u => u.speaker))];
+const color = {}; speakers.forEach((s, i) => color[s] = `var(--sp${i % 8})`);
+const talk = {}; (DATA.utterances || []).forEach(u => talk[u.speaker] = (talk[u.speaker] || 0) + (u.end - u.start));
+const enabled = new Set(speakers);
+const spBox = $('#speakers');
+speakers.forEach(s => {
+  const c = document.createElement('span'); c.className = 'chip'; c.dataset.s = s;
+  c.innerHTML = `<span class="dot" style="background:${color[s]}"></span>${esc(s)} <span class="t">${fmt(talk[s])}</span>`;
+  c.onclick = e => { if (e.shiftKey) { enabled.clear(); enabled.add(s); } else { enabled.has(s) ? enabled.delete(s) : enabled.add(s); if (!enabled.size) speakers.forEach(x => enabled.add(x)); } render(); };
+  spBox.appendChild(c);
+});
+
+// ---- transcript ----
+const lines = $('#lines'); const rows = [];
+(DATA.utterances || []).forEach((u, i) => {
+  const r = document.createElement('div'); r.className = 'line'; r.dataset.i = i; r.dataset.start = u.start;
+  r.innerHTML = `<span class="ts">${fmt(u.start)}</span><span><span class="who" style="color:${color[u.speaker]}">${esc(u.speaker)}</span><span class="txt">${esc(u.text)}</span></span>`;
+  r.onclick = () => { if (video) { video.currentTime = Math.max(0, u.start - 0.3); video.play(); } setNow(i, true); };
+  lines.appendChild(r); rows.push(r);
+});
+
+let q = '';
+function render() {
+  let shown = 0, hits = 0;
+  const needle = q.trim().toLowerCase();
+  rows.forEach((r, i) => {
+    const u = DATA.utterances[i];
+    const okSp = enabled.has(u.speaker);
+    const okQ = !needle || u.text.toLowerCase().includes(needle) || u.speaker.toLowerCase().includes(needle);
+    r.classList.toggle('hide', !(okSp && okQ));
+    const txt = r.querySelector('.txt');
+    if (needle && okSp && okQ) { hits++; const re = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig'); txt.innerHTML = esc(u.text).replace(re, m => `<mark>${m}</mark>`); }
+    else txt.textContent = u.text;
+    if (okSp && okQ) shown++;
+  });
+  document.querySelectorAll('.chip').forEach(c => c.classList.toggle('off', !enabled.has(c.dataset.s)));
+  $('#count').textContent = needle ? `${hits} hit${hits === 1 ? '' : 's'}` : `${shown} lines`;
+}
+$('#q').addEventListener('input', e => { q = e.target.value; render(); });
+render();
+
+// ---- follow playback ----
+let follow = true, nowIdx = -1;
+$('#follow').onclick = () => { follow = !follow; $('#follow').classList.toggle('on', follow); };
+function setNow(i, force) {
+  if (i === nowIdx && !force) return;
+  if (nowIdx >= 0) rows[nowIdx].classList.remove('now');
+  nowIdx = i; if (i < 0) return;
+  rows[i].classList.add('now');
+  if (follow || force) rows[i].scrollIntoView({ block: 'center' });
+}
+if (video) video.addEventListener('timeupdate', () => {
+  const t = video.currentTime; let best = -1;
+  for (let i = 0; i < DATA.utterances.length; i++) { if (DATA.utterances[i].start <= t) best = i; else break; }
+  setNow(best, false);
+});
+
+// ---- keyboard ----
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') { if (e.key === 'Escape') { e.target.value = ''; q = ''; render(); e.target.blur(); } return; }
+  if (e.key === '/') { e.preventDefault(); $('#q').focus(); return; }
+  if (!video) return;
+  if (e.key === ' ') { e.preventDefault(); video.paused ? video.play() : video.pause(); }
+  else if (e.key === 'ArrowLeft') video.currentTime -= 5;
+  else if (e.key === 'ArrowRight') video.currentTime += 5;
+  else if (e.key === 'j' || e.key === 'k') {
+    const vis = rows.filter(r => !r.classList.contains('hide')); if (!vis.length) return;
+    let pos = vis.findIndex(r => +r.dataset.i === nowIdx);
+    pos = e.key === 'j' ? Math.max(0, pos - 1) : Math.min(vis.length - 1, pos + 1);
+    vis[pos].click();
+  }
+});
+
+// ---- copy ----
+$('#copy').onclick = async () => {
+  const txt = rows.filter(r => !r.classList.contains('hide')).map(r => { const u = DATA.utterances[+r.dataset.i]; return `[${fmt(u.start)}] ${u.speaker}: ${u.text}`; }).join('\n');
+  try { await navigator.clipboard.writeText(txt); $('#copy').textContent = 'Copied'; setTimeout(() => $('#copy').textContent = 'Copy transcript', 1200); } catch { alert('Copy failed'); }
+};
+</script>
+</body>
+</html>

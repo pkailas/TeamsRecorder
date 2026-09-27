@@ -9,6 +9,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>TeamsRecorder</RootNamespace>
     <AssemblyName>TeamsRecorder</AssemblyName>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <ApplicationIcon>..\..\assets\TeamsRecorder.ico</ApplicationIcon>
   </PropertyGroup>
 

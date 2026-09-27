@@ -32,6 +32,7 @@ Self-test (acceptance check for GPU):
 from __future__ import annotations
 import argparse
 import glob
+import html
 import json
 import math
 import os
@@ -395,31 +396,34 @@ def write_transcript_md(out_dir: Path, result: dict) -> Path:
     return md_path
 
 
-def write_transcript_srt(out_dir: Path, result: dict) -> Path:
-    """Write <out_dir>/transcript.srt (UTF-8 with BOM) from a transcript dict.
+def _ts(sec: float, sep: str = ",") -> str:
+    """Subtitle timestamp: SRT uses ',', VTT uses '.'."""
+    ms = max(0, int(round(sec * 1000)))
+    h, rem = divmod(ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
 
-    One cue per utterance: index, `HH:MM:SS,mmm --> HH:MM:SS,mmm`, then
-    `Speaker: text`. Utterances longer than 8 s are split across consecutive
-    cues at word boundaries, the time split proportionally.
+
+def _cues(result: dict):
+    """Yield (start, end, speaker, text) cues from a transcript dict.
+
+    One cue per utterance; utterances longer than 8 s are split across
+    consecutive cues at word boundaries, the time split proportionally.
+    Shared by the SRT and VTT writers.
     """
-    def ts(sec: float) -> str:
-        ms = max(0, int(round(sec * 1000)))
-        h, rem = divmod(ms, 3600000)
-        m, rem = divmod(rem, 60000)
-        s, ms = divmod(rem, 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-    def cues_for(u: dict) -> list[tuple[float, float, str]]:
+    for u in result.get("utterances", []):
         start = float(u["start"])
         end = float(u["end"])
         if end <= start:
             end = start + 1.0
         text = u["text"].strip()
         if not text:
-            return []
+            continue
         speaker = u.get("speaker") or "Unknown"
         if end - start <= 8.0:
-            return [(start, end, f"{speaker}: {text}")]
+            yield start, end, speaker, text
+            continue
         # longer than the 8 s display cap: split words proportionally
         words = text.split()
         n = int(math.ceil((end - start) / 8.0))
@@ -427,24 +431,97 @@ def write_transcript_srt(out_dir: Path, result: dict) -> Path:
         for i, w in enumerate(words):
             parts[min(i * n // len(words), n - 1)].append(w)
         dur = (end - start) / n
-        out: list[tuple[float, float, str]] = []
         for j, part in enumerate(parts):
             if not part:
                 continue
-            out.append((start + j * dur, start + (j + 1) * dur,
-                        f"{speaker}: {' '.join(part)}"))
-        return out
+            yield (start + j * dur, start + (j + 1) * dur,
+                   speaker, " ".join(part))
 
+
+def write_transcript_srt(out_dir: Path, result: dict) -> Path:
+    """Write <out_dir>/transcript.srt (UTF-8 with BOM) from a transcript dict.
+
+    One cue per utterance: index, `HH:MM:SS,mmm --> HH:MM:SS,mmm`, then
+    `Speaker: text` (cue splitting via the shared `_cues` generator).
+    """
     srt_path = out_dir / "transcript.srt"
     lines: list[str] = []
     idx = 0
-    for u in result.get("utterances", []):
-        for cstart, cend, ctext in cues_for(u):
-            idx += 1
-            lines.append(f"{idx}\n{ts(cstart)} --> {ts(cend)}\n{ctext}\n")
+    for cstart, cend, speaker, text in _cues(result):
+        idx += 1
+        lines.append(f"{idx}\n{_ts(cstart)} --> {_ts(cend)}\n{speaker}: {text}\n")
     with open(srt_path, "w", encoding="utf-8-sig", newline="") as f:
         f.write("\n".join(lines))
     return srt_path
+
+
+def write_transcript_vtt(out_dir: Path, result: dict) -> Path:
+    """Write <out_dir>/transcript.vtt (WebVTT) from a transcript dict.
+
+    Same cues as the SRT, but VTT-style: `.` instead of `,` in timestamps,
+    no index lines, and the speaker prefix as a `<v Name>` voice tag — the
+    format a browser's <track> element needs.
+    """
+    vtt_path = out_dir / "transcript.vtt"
+    lines: list[str] = ["WEBVTT", ""]
+    for cstart, cend, speaker, text in _cues(result):
+        lines.append(f"{_ts(cstart, '.')} --> {_ts(cend, '.')}\n<v {speaker}>{text}\n")
+    with open(vtt_path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write("\n".join(lines))
+    return vtt_path
+
+
+def write_meeting_html(out_dir: Path, result: dict) -> Path:
+    """Render <out_dir>/meeting.html — the self-contained meeting page.
+
+    The transcript (title, created, duration, speakers, and the FINAL merged
+    utterances — no embeddings, no mic_dropped; the page stays small) and the
+    session's file list are substituted into sidecar/meeting_template.html.
+    Tokens are replaced with str.replace (the template is full of JS braces,
+    so str.format is out); `</` in the JSON payloads is escaped to `<\\/`
+    because they land inside a <script> block.
+    """
+    out_dir = Path(out_dir)
+    title = result.get("title") or out_dir.name
+    data = {
+        "title": title,
+        "created": result.get("created"),
+        "duration_sec": result.get("duration_sec"),
+        "speakers": result.get("speakers", []),
+        "utterances": [
+            {"start": u["start"], "end": u["end"],
+             "speaker": u.get("speaker"), "text": u.get("text", "")}
+            for u in result.get("utterances", [])
+        ],
+    }
+    # meeting.mp4 (video + audio + subs) wins; fall back to the silent
+    # video.mp4; else no video at all.
+    video = None
+    if (out_dir / "meeting.mp4").exists():
+        video = "meeting.mp4"
+    elif (out_dir / "video.mp4").exists():
+        video = "video.mp4"
+    files = {
+        "video": video,
+        "md": "transcript.md",
+        "srt": "transcript.srt",
+        "json": "transcript.json",
+        "vtt": "transcript.vtt" if (out_dir / "transcript.vtt").exists() else None,
+    }
+    template = (Path(__file__).resolve().parent / "meeting_template.html") \
+        .read_text(encoding="utf-8-sig")
+
+    def payload(obj) -> str:
+        return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+
+    page = template.replace("__TITLE__", html.escape(title)) \
+                   .replace("__DATA__", payload(data)) \
+                   .replace("__FILES__", payload(files))
+    page_path = out_dir / "meeting.html"
+    with open(page_path, "w", encoding="utf-8", newline="") as f:
+        f.write(page)
+    log(f"Wrote {page_path}")
+    return page_path
 
 
 def transcript_result(args, model_name: str, paul_utterances: list,
@@ -485,6 +562,7 @@ def transcript_result(args, model_name: str, paul_utterances: list,
 
 
 def write_transcript(out_dir: Path, result: dict) -> None:
+    result.setdefault("title", out_dir.name)
     json_path = out_dir / "transcript.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
@@ -493,11 +571,15 @@ def write_transcript(out_dir: Path, result: dict) -> None:
     log(f"Wrote {md_path}")
     srt_path = write_transcript_srt(out_dir, result)
     log(f"Wrote {srt_path}")
+    vtt_path = write_transcript_vtt(out_dir, result)
+    log(f"Wrote {vtt_path}")
     # let the app/page find the subtitle file and (later) the muxed video
     result["srt"] = "transcript.srt"
+    result["vtt"] = "transcript.vtt"
     result.setdefault("meeting_mp4", None)
     with open(out_dir / "transcript.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
+    write_meeting_html(out_dir, result)
 
 
 # --------------------------------------------------------------------------
@@ -613,7 +695,14 @@ def cmd_mux(args) -> int:
     result = mux_meeting_video(session, args.ffmpeg)
     # here a None return means ffmpeg (or ffprobe) failed; the details are in
     # mux.log and were already logged by mux_meeting_video
-    return 0 if result is not None else 1
+    if result is None:
+        return 1
+    # Re-render meeting.html so FILES.video reflects the fresh meeting.mp4.
+    json_path = session / "transcript.json"
+    if json_path.exists():
+        with open(json_path, "r", encoding="utf-8") as f:
+            write_meeting_html(session, json.load(f))
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -871,6 +960,9 @@ def run_transcription(args) -> int:
                                  if (out_dir / "meeting.mp4").exists() else None)
         with open(out_dir / "transcript.json", "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
+        # meeting.html was rendered earlier (in write_transcript) before the
+        # mux ran: re-render now so FILES.video points at the fresh meeting.mp4.
+        write_meeting_html(out_dir, result)
     except Exception as exc:
         log(f"mux: unexpected error, skipped: {exc}")
 

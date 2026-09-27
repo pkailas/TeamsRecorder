@@ -58,7 +58,22 @@ instead. The right-click menu also has:
   WAV files (enabled whenever a session with `mic.wav` and `loopback.wav`
   exists, including after an app restart; disabled while a transcription is
   running).
+- **Open last meeting** — opens `meeting.html` (the self-contained meeting
+  page) in the default browser (disabled until the last session has one).
 - **Open last transcript** — opens `transcript.md` in the default app.
+
+## Meeting page
+
+The sidecar also writes a **`meeting.html`** next to the transcript — a
+self-contained page with the video (the muxed `meeting.mp4` if present,
+falling back to the silent `video.mp4`, else transcript-only) and the full
+transcript: speaker chips with talk time, search, playback-synced highlighting,
+and downloadable copies of the transcript files. The transcript is embedded as
+JSON, and `transcript.vtt` is written next to the SRT so the browser can show
+captions on the video. You can reach it three ways: the **Open last meeting**
+tray menu item, clicking the **"Transcript ready"** balloon (its text becomes
+"Click to open the meeting page"), or automatically — as soon as you save the
+**Name speakers** dialog, the freshly renamed page opens in your browser.
 
 ## Publish (recommended way to run it)
 

@@ -17,6 +17,7 @@ public sealed class TrayContext : ApplicationContext
     private readonly Settings _settings;
     private readonly ToolStripMenuItem _nameSpeakersItem;
     private readonly ToolStripMenuItem _retranscribeItem;
+    private readonly ToolStripMenuItem _openMeetingItem;
     private readonly ToolStripMenuItem _openTranscriptItem;
     private readonly ToolStripMenuItem _startWithWindowsItem;
     private DateTime _startedAt;
@@ -34,6 +35,12 @@ public sealed class TrayContext : ApplicationContext
 
     /// <summary>True while a sidecar transcription is running (auto or manual).</summary>
     private bool _transcriptionRunning;
+
+    /// <summary>
+    /// File to open when the "Transcript ready" balloon is clicked (set by that
+    /// balloon; cleared on click and by every other balloon). Null = no action.
+    /// </summary>
+    private string? _pendingOpen;
 
     // Both icons are embedded from assets\ (see csproj). Idle = grey dot, recording = red dot.
     private static readonly Icon IdleIcon = LoadEmbeddedIcon("TeamsRecorder.idle.ico");
@@ -69,6 +76,12 @@ public sealed class TrayContext : ApplicationContext
         };
         _retranscribeItem.Click += (_, _) => RetranscribeLastRecording();
 
+        _openMeetingItem = new ToolStripMenuItem("Open last meeting")
+        {
+            Enabled = false,
+        };
+        _openMeetingItem.Click += (_, _) => OpenLastMeeting();
+
         _openTranscriptItem = new ToolStripMenuItem("Open last transcript")
         {
             Enabled = false,
@@ -98,6 +111,7 @@ public sealed class TrayContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_nameSpeakersItem);
         menu.Items.Add(_retranscribeItem);
+        menu.Items.Add(_openMeetingItem);
         menu.Items.Add(_openTranscriptItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(openFolderItem);
@@ -119,6 +133,7 @@ public sealed class TrayContext : ApplicationContext
             Text = "Teams Recorder — idle",
         };
         _notifyIcon.DoubleClick += (_, _) => ToggleRecording();
+        _notifyIcon.BalloonTipClicked += OnBalloonTipClicked;
 
         // Make sure the Start Menu (Programs) entry points at this exe, even
         // after a rebuild moved it. Failures are silent — this is best-effort.
@@ -141,6 +156,7 @@ public sealed class TrayContext : ApplicationContext
             _nameSpeakersItem.Enabled = _lastTranscript is { } t && t.Unnamed.Any();
             _retranscribeItem.Enabled = true;
             _openTranscriptItem.Enabled = File.Exists(Path.Combine(lastFolder, "transcript.md"));
+            _openMeetingItem.Enabled = File.Exists(Path.Combine(lastFolder, "meeting.html"));
         }
 
         // --- 1 s timer for the tooltip ---
@@ -409,9 +425,26 @@ public sealed class TrayContext : ApplicationContext
 
     private void ShowBalloon(string title, string message)
     {
+        // Every balloon other than the "Transcript ready" meeting-page one has
+        // no click action: clear the pending open (that balloon re-sets it
+        // after this returns).
+        _pendingOpen = null;
         _notifyIcon.BalloonTipTitle = title;
         _notifyIcon.BalloonTipText = message;
         _notifyIcon.ShowBalloonTip(3000);
+    }
+
+    /// <summary>
+    /// A balloon was clicked: opens the pending file if the "Transcript ready"
+    /// balloon set one (meeting.html); all other balloons leave it null.
+    /// </summary>
+    private void OnBalloonTipClicked(object? sender, EventArgs e)
+    {
+        var path = _pendingOpen;
+        _pendingOpen = null;
+        if (path is null)
+            return;
+        OpenInShell(path);
     }
 
     /// <summary>
@@ -480,7 +513,7 @@ public sealed class TrayContext : ApplicationContext
         var info = TranscriptInfo.Load(sessionFolder);
         if (info is null)
         {
-            ShowBalloon("Transcript ready", sessionFolder);
+            ShowReadyBalloon(sessionFolder);
             return;
         }
 
@@ -494,6 +527,7 @@ public sealed class TrayContext : ApplicationContext
             _retranscribeItem.Enabled = true;
             var md = Path.Combine(sessionFolder, "transcript.md");
             _openTranscriptItem.Enabled = File.Exists(md);
+            _openMeetingItem.Enabled = File.Exists(Path.Combine(sessionFolder, "meeting.html"));
         }, null);
 
         if (info.Unnamed.Any())
@@ -503,7 +537,7 @@ public sealed class TrayContext : ApplicationContext
         }
         else
         {
-            ShowBalloon("Transcript ready", sessionFolder);
+            ShowReadyBalloon(sessionFolder);
         }
     }
 
@@ -536,6 +570,11 @@ public sealed class TrayContext : ApplicationContext
                     if (reloaded is not null)
                         _lastTranscript = reloaded;
                     _nameSpeakersItem.Enabled = _lastTranscript is { } t && t.Unnamed.Any();
+                    var meeting = Path.Combine(sessionFolder, "meeting.html");
+                    _openMeetingItem.Enabled = File.Exists(meeting);
+                    // The freshly renamed result is what the user just asked for: show it.
+                    if (File.Exists(meeting))
+                        OpenInShell(meeting);
                     ShowBalloon("Speakers saved", $"Renamed {form.Assignments.Count} speaker(s). Voice enrolled.");
                 }
                 else
@@ -575,6 +614,11 @@ public sealed class TrayContext : ApplicationContext
                     if (reloaded is not null)
                         _lastTranscript = reloaded;
                     _nameSpeakersItem.Enabled = _lastTranscript is { } t && t.Unnamed.Any();
+                    var meeting = Path.Combine(folder, "meeting.html");
+                    _openMeetingItem.Enabled = File.Exists(meeting);
+                    // The freshly renamed result is what the user just asked for: show it.
+                    if (File.Exists(meeting))
+                        OpenInShell(meeting);
                     ShowBalloon("Speakers saved", $"Renamed {form.Assignments.Count} speaker(s). Voice enrolled.");
                 }
                 else
@@ -602,6 +646,50 @@ public sealed class TrayContext : ApplicationContext
             Path.Combine(folder, "mic.wav"),
             Path.Combine(folder, "loopback.wav"),
             folder);
+    }
+
+    /// <summary>
+    /// Shows the "Transcript ready" balloon; if the session has a meeting page,
+    /// the balloon offers to open it (click -> meeting.html via _pendingOpen).
+    /// </summary>
+    private void ShowReadyBalloon(string sessionFolder)
+    {
+        var meeting = Path.Combine(sessionFolder, "meeting.html");
+        ShowBalloon("Transcript ready",
+            File.Exists(meeting) ? "Click to open the meeting page" : sessionFolder);
+        // Set after ShowBalloon returns: it clears _pendingOpen for the other
+        // balloons, so the ready balloon wins.
+        _pendingOpen = File.Exists(meeting) ? meeting : null;
+    }
+
+    /// <summary>Opens a file with its default app via the shell; failures show a message box.</summary>
+    private static void OpenInShell(string path)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = path,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "Teams Recorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    /// <summary>Opens the most recent meeting.html in the default browser (context menu).</summary>
+    private void OpenLastMeeting()
+    {
+        if (_lastSessionFolder is not { } folder)
+            return;
+
+        var html = Path.Combine(folder, "meeting.html");
+        if (!File.Exists(html))
+            return;
+
+        OpenInShell(html);
     }
 
     /// <summary>Opens the most recent transcript.md with the default app (context menu).</summary>
