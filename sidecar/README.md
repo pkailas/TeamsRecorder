@@ -53,9 +53,15 @@ Outputs (written into the session folder):
         "text": "...mic utterance dropped as bleed...",
         "matched_loopback_text": "...the overlapping loopback utterance(s) it matched..."
       }
-    ]
+    ],
+    "srt": "transcript.srt",
+    "meeting_mp4": "meeting.mp4"
   }
   ```
+
+  `srt` is always `transcript.srt`; `meeting_mp4` is `"meeting.mp4"` when the
+  mux produced a file, `null` when there was no `video.mp4` (or the mux
+  failed).
 
   `speaker_map` has one entry per diarized speaker (order of first appearance),
   so the C# app can build its speaker-naming dialog from it:
@@ -77,6 +83,18 @@ Outputs (written into the session folder):
   **\[00:01:02\] Paul:** hello everyone
   **\[00:01:05\] Speaker 1:** hi Paul
   ```
+
+- `transcript.srt` — SubRip subtitles, one cue per utterance
+  (`index` / `HH:MM:SS,mmm --> HH:MM:SS,mmm` / `Speaker: text`), UTF-8 with
+  BOM. Utterances longer than 8 s are split across consecutive cues at word
+  boundaries, the time split proportionally.
+- `meeting.mp4` — present only when the session also contains `video.mp4`
+  (the tray app's silent capture): the video with the two WAVs mixed in as
+  AAC audio and `transcript.srt` embedded as a soft subtitle track
+  (`mov_text`, language `eng`). `video.mp4` itself is left untouched. A
+  missing `video.mp4` is not an error — the transcript is written and the
+  mux is simply skipped. ffmpeg's stderr goes to `mux.log` in the session
+  folder. See *Muxing* below.
 
 The C# app launches:
 
@@ -183,8 +201,43 @@ Loads `<session>\transcript.json`, renames each `OldLabel` to `NewName`
 everywhere (`speakers`, `utterances[].speaker`, `speaker_map[].label/name`),
 appends that speaker's `embedding` to the store under the new name (unless
 `--no-enroll`), rewrites `transcript.json` and regenerates `transcript.md`
-from the same writer used by normal mode. Exits 0/1 like the main mode.
-`rename` does not import torch/pyannote/faster-whisper, so it starts fast.
+and `transcript.srt` from the same writer used by normal mode. Exits 0/1
+like the main mode. `rename` does not import torch/pyannote/faster-whisper,
+so it starts fast.
+
+### Mux (no GPU needed)
+
+```powershell
+.\sidecar\.venv\Scripts\python.exe sidecar\transcribe.py mux \
+    --session .\sessions <dir> \
+    [--ffmpeg PATH]            # default: G:\tools\ffmpeg\8.0.1\ffmpeg.exe
+```
+
+Builds `<session>\meeting.mp4` from the session's `video.mp4`, `mic.wav`,
+`loopback.wav` and `transcript.srt`. The **audio is the master timeline**
+(the longest of the two WAVs): `mic.wav` and `loopback.wav` are summed with
+`amix=inputs=2:duration=longest:normalize=0` and peak-capped with
+`alimiter` (hard 0 dBFS limit; chosen over `dynaudnorm` because a brick-wall
+limiter never pumps and never shifts perceived levels), encoded as AAC 128k.
+
+- **Video shorter than the audio** (by more than 0.5 s): the video is padded
+  with its last frame (`tpad=stop_mode=clone:stop_duration=<gap>`), which
+  requires re-encoding — `-c:v h264_nvenc -preset p4 -rc vbr -cq 28`.
+- **Video at least as long**: `-c:v copy` and a `-t <audio_duration>` trim.
+  Note that with stream copy the cut lands on the next keyframe, so the
+  video stream can overshoot the audio by up to one GOP (~5 s in the
+  capture); the audio stream is exact and players stop at the shorter
+  stream. `-movflags +faststart` is set in both cases.
+- `transcript.srt` is embedded as a soft subtitle track
+  (`-c:s mov_text -metadata:s:s:0 language=eng`).
+
+The branch taken (padded/trimmed) and the durations are logged; ffmpeg's
+stderr is written to `<session>\mux.log`. A missing `video.mp4` logs
+`no video.mp4; skipping mux` and exits 0 (not an error); an ffmpeg failure
+logs the last 20 lines of `mux.log` and exits 1. Normal transcription runs
+the mux automatically after writing the transcript — a mux failure there
+never fails the transcription, and `meeting_mp4` in `transcript.json` is
+`null` in that case.
 
 ## Pipeline details
 

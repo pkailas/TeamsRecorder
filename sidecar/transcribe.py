@@ -6,7 +6,11 @@ Transcribes the two WAV files produced by the tray app:
   --mic        mic.wav        (the local user, "Paul")
   --loopback   loopback.wav   (everyone else; diarized with pyannote)
 
-and writes <out>/transcript.json and <out>/transcript.md.
+and writes <out>/transcript.json, <out>/transcript.md and <out>/transcript.srt.
+
+If <out>/video.mp4 exists (the tray app's silent capture), the two WAVs
+are mixed and muxed with it into <out>/meeting.mp4 (video + AAC audio +
+soft SRT subtitles). A missing video.mp4 is not an error.
 
 Speakers that were already enrolled (via `rename`) are recognised
 automatically: each diarized speaker's voice embedding is matched by cosine
@@ -29,8 +33,10 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import site
+import subprocess
 import sys
 import time
 import traceback
@@ -389,6 +395,58 @@ def write_transcript_md(out_dir: Path, result: dict) -> Path:
     return md_path
 
 
+def write_transcript_srt(out_dir: Path, result: dict) -> Path:
+    """Write <out_dir>/transcript.srt (UTF-8 with BOM) from a transcript dict.
+
+    One cue per utterance: index, `HH:MM:SS,mmm --> HH:MM:SS,mmm`, then
+    `Speaker: text`. Utterances longer than 8 s are split across consecutive
+    cues at word boundaries, the time split proportionally.
+    """
+    def ts(sec: float) -> str:
+        ms = max(0, int(round(sec * 1000)))
+        h, rem = divmod(ms, 3600000)
+        m, rem = divmod(rem, 60000)
+        s, ms = divmod(rem, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    def cues_for(u: dict) -> list[tuple[float, float, str]]:
+        start = float(u["start"])
+        end = float(u["end"])
+        if end <= start:
+            end = start + 1.0
+        text = u["text"].strip()
+        if not text:
+            return []
+        speaker = u.get("speaker") or "Unknown"
+        if end - start <= 8.0:
+            return [(start, end, f"{speaker}: {text}")]
+        # longer than the 8 s display cap: split words proportionally
+        words = text.split()
+        n = int(math.ceil((end - start) / 8.0))
+        parts: list[list[str]] = [[] for _ in range(n)]
+        for i, w in enumerate(words):
+            parts[min(i * n // len(words), n - 1)].append(w)
+        dur = (end - start) / n
+        out: list[tuple[float, float, str]] = []
+        for j, part in enumerate(parts):
+            if not part:
+                continue
+            out.append((start + j * dur, start + (j + 1) * dur,
+                        f"{speaker}: {' '.join(part)}"))
+        return out
+
+    srt_path = out_dir / "transcript.srt"
+    lines: list[str] = []
+    idx = 0
+    for u in result.get("utterances", []):
+        for cstart, cend, ctext in cues_for(u):
+            idx += 1
+            lines.append(f"{idx}\n{ts(cstart)} --> {ts(cend)}\n{ctext}\n")
+    with open(srt_path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write("\n".join(lines))
+    return srt_path
+
+
 def transcript_result(args, model_name: str, paul_utterances: list,
                        loopback_utterances: list, diar_turns_out: list,
                        speaker_map: list | None, notes: list,
@@ -433,6 +491,129 @@ def write_transcript(out_dir: Path, result: dict) -> None:
     log(f"Wrote {json_path}")
     md_path = write_transcript_md(out_dir, result)
     log(f"Wrote {md_path}")
+    srt_path = write_transcript_srt(out_dir, result)
+    log(f"Wrote {srt_path}")
+    # let the app/page find the subtitle file and (later) the muxed video
+    result["srt"] = "transcript.srt"
+    result.setdefault("meeting_mp4", None)
+    with open(out_dir / "transcript.json", "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
+# Mux: video.mp4 + mixed WAVs + transcript.srt -> meeting.mp4 (no GPU)
+# --------------------------------------------------------------------------
+DEFAULT_FFMPEG = r"G:\tools\ffmpeg\8.0.1\ffmpeg.exe"
+
+
+def _probe_duration(ffprobe: str, path: Path) -> float:
+    """Format duration of a media file, in seconds (ffprobe)."""
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True).stdout.strip()
+    return float(out)
+
+
+def mux_meeting_video(session_dir: Path, ffmpeg: str = DEFAULT_FFMPEG) -> Path | None:
+    """Mux the session's video.mp4 with the mixed mic+loopback audio and the
+    transcript SRT into <session_dir>/meeting.mp4. The audio is the master
+    timeline: a longer video is trimmed, a shorter one is padded with its
+    last frame (tpad clone, re-encoded with h264_nvenc). ffmpeg's stderr is
+    written to <session_dir>/mux.log. Returns the output path, or None if the
+    video is absent or ffmpeg fails (a mux failure is never an error).
+    """
+    session_dir = Path(session_dir)
+    ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe"))
+    video = session_dir / "video.mp4"
+    mic = session_dir / "mic.wav"
+    loopback = session_dir / "loopback.wav"
+    srt = session_dir / "transcript.srt"
+    out = session_dir / "meeting.mp4"
+    log_path = session_dir / "mux.log"
+
+    if not video.exists():
+        log("no video.mp4; skipping mux")
+        return None
+    missing = [p.name for p in (mic, loopback, srt) if not p.exists()]
+    if missing:
+        log(f"mux: missing {', '.join(missing)}; skipping mux")
+        return None
+
+    try:
+        video_dur = _probe_duration(ffprobe, video)
+        # audio is the master timeline: longest track wins (amix duration=longest)
+        audio_dur = max(_probe_duration(ffprobe, mic),
+                        _probe_duration(ffprobe, loopback))
+    except Exception as exc:
+        log(f"mux: ffprobe failed: {exc}")
+        return None
+
+    # amix with normalize=0 (no implicit 0.5 gain), then alimiter to keep the
+    # sum of the two 16-bit tracks from clipping: hard peak cap at 0 dBFS
+    # (level auto-limit is on by default).
+    audio_filter = ("[1:a][2:a]amix=inputs=2:duration=longest:normalize=0,"
+                    "alimiter=attack=5:release=50[a]")
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+           "-i", str(video), "-i", str(mic), "-i", str(loopback),
+           "-i", str(srt)]
+    if audio_dur - video_dur > 0.5:
+        # video shorter than audio: pad with the last frame; tpad requires a
+        # re-encode, so use h264_nvenc (verified working on this box)
+        stop = round(audio_dur - video_dur, 3)
+        log(f"mux: video {video_dur:.1f}s shorter than audio {audio_dur:.1f}s; "
+            f"tpad last frame by {stop:.3f}s (h264_nvenc re-encode)")
+        video_filter = (f"[0:v:0]tpad=stop_mode=clone:"
+                        f"stop_duration={stop}[v]")
+        video_args = ["-map", "[v]",
+                      "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr",
+                      "-cq", "28"]
+    else:
+        log(f"mux: video {video_dur:.1f}s >= audio {audio_dur:.1f}s; "
+            f"-c:v copy, trim to audio duration")
+        video_filter = None
+        video_args = ["-map", "0:v:0", "-c:v", "copy"]
+    graph = (f"{video_filter};{audio_filter}" if video_filter else audio_filter)
+    cmd += ["-filter_complex", graph,
+            *video_args,
+            "-map", "[a]",
+            "-map", "3:0", "-c:s", "mov_text",
+            "-metadata:s:s:0", "language=eng",
+            "-t", f"{audio_dur:.3f}",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(out)]
+
+    with open(log_path, "w", encoding="utf-8") as lf:
+        proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                              text=True)
+    if proc.returncode != 0:
+        try:
+            tail = log_path.read_text(encoding="utf-8", errors="replace") \
+                .splitlines()[-20:]
+        except Exception:
+            tail = ["(mux.log unreadable)"]
+        log(f"mux: ffmpeg failed (exit {proc.returncode}); last lines of mux.log:")
+        for line in tail:
+            log(f"  {line}")
+        return None
+    log(f"mux: wrote {out.name} (audio {audio_dur:.1f}s, "
+        f"video {'padded' if audio_dur - video_dur > 0.5 else 'trimmed'})")
+    return out
+
+
+def cmd_mux(args) -> int:
+    session = Path(args.session)
+    if not session.is_dir():
+        print(f"error: session directory not found: {session}", file=sys.stderr)
+        return 1
+    if not (session / "video.mp4").exists():
+        log("no video.mp4; skipping mux")
+        return 0
+    result = mux_meeting_video(session, args.ffmpeg)
+    # here a None return means ffmpeg (or ffprobe) failed; the details are in
+    # mux.log and were already logged by mux_meeting_video
+    return 0 if result is not None else 1
 
 
 # --------------------------------------------------------------------------
@@ -681,6 +862,17 @@ def run_transcription(args) -> int:
         mic_bleed_dropped=mic_bleed_dropped, mic_dropped=mic_dropped)
 
     write_transcript(out_dir, result)
+
+    # -- Mux video.mp4 + mixed audio + SRT -> meeting.mp4 (bonus; a failure
+    #    here never fails the transcription) --------------------------------
+    try:
+        mux_meeting_video(out_dir)
+        result["meeting_mp4"] = ("meeting.mp4"
+                                 if (out_dir / "meeting.mp4").exists() else None)
+        with open(out_dir / "transcript.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        log(f"mux: unexpected error, skipped: {exc}")
 
     # -- Free GPU ----------------------------------------------------------
     del model
@@ -946,6 +1138,16 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--speakers-file",
                     help="Speaker store JSON path "
                          "(default: %%LOCALAPPDATA%%\\TeamsRecorder\\speakers.json).")
+    mp = sub.add_parser(
+        "mux",
+        help="Mux video.mp4 + mixed mic/loopback audio + transcript.srt into "
+             "meeting.mp4 (no GPU needed).")
+    mp.add_argument("--session", required=True,
+                    help="Session directory containing video.mp4, mic.wav, "
+                         "loopback.wav and transcript.srt.")
+    mp.add_argument("--ffmpeg",
+                    default=DEFAULT_FFMPEG,
+                    help=f"Path to ffmpeg.exe (default: {DEFAULT_FFMPEG}).")
     return parser
 
 
@@ -961,6 +1163,12 @@ def main() -> int:
             print("error: rename requires --session", file=sys.stderr)
             return 1
         return cmd_rename(args)
+
+    if args.command == "mux":
+        if not args.session:
+            print("error: mux requires --session", file=sys.stderr)
+            return 1
+        return cmd_mux(args)
 
     # default: normal transcription mode
     missing = [a for a in ("mic", "loopback", "out") if not getattr(args, a)]
