@@ -547,6 +547,26 @@ public sealed class TrayContext : ApplicationContext
     /// </summary>
     private void ShowNameSpeakersDialog(TranscriptInfo info, string sessionFolder)
     {
+        PromptAndRenameSpeakers(sessionFolder, info);
+    }
+
+    /// <summary>Reopens the naming dialog for the most recent session (context menu).</summary>
+    private void NameSpeakersInLastRecording()
+    {
+        if (_lastSessionFolder is not { } folder || _lastTranscript is not { } info)
+            return;
+
+        PromptAndRenameSpeakers(folder, info);
+    }
+
+    /// <summary>
+    /// Shows the speaker-naming dialog; on Save runs the sidecar's rename
+    /// subcommand in the background and reports the result via balloon.
+    /// The assignments are snapshotted before the form is disposed so the
+    /// background task never touches the form.
+    /// </summary>
+    private void PromptAndRenameSpeakers(string sessionFolder, TranscriptInfo info)
+    {
         using var form = new NameSpeakersForm(sessionFolder, info);
         if (form.ShowDialog() != DialogResult.OK)
             return;
@@ -557,10 +577,14 @@ public sealed class TrayContext : ApplicationContext
             return;
         }
 
-        ShowBalloon("Naming speakers…", $"{form.Assignments.Count} speaker(s) — running sidecar rename.");
+        // Snapshot before the form is disposed below: the lambda must not
+        // reference the form after this method returns.
+        var assignments = form.Assignments;
+
+        ShowBalloon("Naming speakers…", $"{assignments.Count} speaker(s) — running sidecar rename.");
         _ = Task.Run(async () =>
         {
-            var exitCode = await SidecarRunner.RenameAsync(_settings, sessionFolder, form.Assignments);
+            var exitCode = await SidecarRunner.RenameAsync(_settings, sessionFolder, assignments);
             _uiContext?.Post(_ =>
             {
                 if (exitCode == 0)
@@ -575,56 +599,12 @@ public sealed class TrayContext : ApplicationContext
                     // The freshly renamed result is what the user just asked for: show it.
                     if (File.Exists(meeting))
                         OpenInShell(meeting);
-                    ShowBalloon("Speakers saved", $"Renamed {form.Assignments.Count} speaker(s). Voice enrolled.");
+                    ShowBalloon("Speakers saved", $"Renamed {assignments.Count} speaker(s). Voice enrolled.");
                 }
                 else
                 {
                     ShowBalloon("Rename failed — see sidecar.log",
                         Path.Combine(sessionFolder, "sidecar.log"));
-                }
-            }, null);
-        });
-    }
-
-    /// <summary>Reopens the naming dialog for the most recent session (context menu).</summary>
-    private void NameSpeakersInLastRecording()
-    {
-        if (_lastSessionFolder is not { } folder || _lastTranscript is not { } info)
-            return;
-
-        using var form = new NameSpeakersForm(folder, info);
-        if (form.ShowDialog() != DialogResult.OK)
-            return;
-
-        if (form.Assignments.Count == 0)
-        {
-            ShowBalloon("Speakers saved", "No names entered.");
-            return;
-        }
-
-        ShowBalloon("Naming speakers…", $"{form.Assignments.Count} speaker(s) — running sidecar rename.");
-        _ = Task.Run(async () =>
-        {
-            var exitCode = await SidecarRunner.RenameAsync(_settings, folder, form.Assignments);
-            _uiContext?.Post(_ =>
-            {
-                if (exitCode == 0)
-                {
-                    var reloaded = TranscriptInfo.Load(folder);
-                    if (reloaded is not null)
-                        _lastTranscript = reloaded;
-                    _nameSpeakersItem.Enabled = _lastTranscript is { } t && t.Unnamed.Any();
-                    var meeting = Path.Combine(folder, "meeting.html");
-                    _openMeetingItem.Enabled = File.Exists(meeting);
-                    // The freshly renamed result is what the user just asked for: show it.
-                    if (File.Exists(meeting))
-                        OpenInShell(meeting);
-                    ShowBalloon("Speakers saved", $"Renamed {form.Assignments.Count} speaker(s). Voice enrolled.");
-                }
-                else
-                {
-                    ShowBalloon("Rename failed — see sidecar.log",
-                        Path.Combine(folder, "sidecar.log"));
                 }
             }, null);
         });
