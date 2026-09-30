@@ -183,9 +183,17 @@ public sealed class TrayContext : ApplicationContext
             _recorder.Start(_settings);
             _startedAt = DateTime.Now;
 
+            // --- Meeting window + session.json ---
+            // The session folder exists now (Recorder.Start created it), and the
+            // window lookup is pure (no WinRT session required), so do it exactly
+            // once here regardless of VideoOn. session.json is written best-effort
+            // and never blocks or fails audio recording.
+            var (hwnd, windowTitle) = FindMeetingWindowForSession();
+            WriteSessionInfo(hwnd, windowTitle);
+
             // --- Video capture (best-effort; audio is already running) ---
             if (_settings.VideoOn)
-                StartVideoCapture();
+                StartVideoCapture(hwnd);
             UpdateIcon(recording: true);
             _startItem.Enabled = false;
             _stopItem.Enabled = true;
@@ -202,24 +210,18 @@ public sealed class TrayContext : ApplicationContext
     }
 
     /// <summary>
-    /// Starts window video capture for the active session (best-effort). Any failure is
-    /// logged + reported with a balloon; audio recording is never affected.
+    /// Starts window video capture for the active session (best-effort), using the
+    /// meeting window already located at record start (see StartRecording). Any
+    /// failure is logged + reported with a balloon; audio recording is never
+    /// affected. A zero <paramref name="hwnd"/> means no Teams window was found;
+    /// the skip + balloon behaviour is unchanged.
     /// </summary>
-    private void StartVideoCapture()
+    private void StartVideoCapture(IntPtr hwnd)
     {
         try
         {
             var sessionFolder = _recorder.SessionFolder
                 ?? throw new InvalidOperationException("No active session folder.");
-
-            var (hwnd, title, candidates) = WindowCapture.FindTeamsMeetingWindowCore();
-
-            // Log every candidate ms-teams window (title, hwnd, size) and which one was
-            // chosen. The meeting-window title pattern is unverified, so capture the real
-            // titles to recorder.log after the first live meeting.
-            foreach (var c in candidates)
-                LogVideo($"candidate ms-teams window: hwnd=0x{c.Hwnd:X} {c.W}x{c.H} \"{c.Title}\"", "recorder.log");
-            LogVideo($"chosen meeting window: hwnd=0x{hwnd:X} \"{title}\"", "recorder.log");
 
             if (hwnd == IntPtr.Zero)
             {
@@ -285,6 +287,60 @@ public sealed class TrayContext : ApplicationContext
         catch
         {
             // Never let logging take down the capture.
+        }
+    }
+
+    /// <summary>
+    /// Finds the Teams meeting window for the active session and logs every
+    /// candidate plus the chosen one to recorder.log. Pure (no WinRT session), so
+    /// it runs once at record start regardless of VideoOn. Returns the chosen
+    /// (hwnd, title); hwnd is zero and title empty when no ms-teams window exists.
+    /// </summary>
+    private (IntPtr hwnd, string title) FindMeetingWindowForSession()
+    {
+        var (hwnd, title, candidates) = WindowCapture.FindTeamsMeetingWindowCore();
+
+        // Log every candidate ms-teams window (title, hwnd, size) and which one was
+        // chosen. The meeting-window title pattern is unverified, so capture the real
+        // titles to recorder.log after the first live meeting.
+        foreach (var (cHwnd, cTitle, cW, cH) in candidates)
+            LogVideo($"candidate ms-teams window: hwnd=0x{cHwnd:X} {cW}x{cH} \"{cTitle}\"", "recorder.log");
+        LogVideo($"chosen meeting window: hwnd=0x{hwnd:X} \"{title}\"", "recorder.log");
+
+        return (hwnd, title);
+    }
+
+    /// <summary>
+    /// Writes <c>&lt;session&gt;\session.json</c> with the parsed meeting title. Purely
+    /// best-effort: any failure is logged to recorder.log and audio recording is
+    /// never blocked. A missing window (zero hwnd) still writes a record with nulls.
+    /// </summary>
+    private void WriteSessionInfo(IntPtr hwnd, string windowTitle)
+    {
+        try
+        {
+            var sessionFolder = _recorder.SessionFolder;
+            if (sessionFolder is null)
+            {
+                LogVideo("session.json skipped: no active session folder.", "recorder.log");
+                return;
+            }
+
+            var rawTitle = hwnd == IntPtr.Zero ? null : windowTitle;
+            var info = new SessionInfo
+            {
+                Title = SessionInfo.ParseMeetingTitle(rawTitle),
+                WindowTitle = rawTitle,
+                StartedLocal = DateTimeOffset.Now,
+            };
+            info.WriteTo(sessionFolder);
+            LogVideo($"session.json written: title=\"{info.Title}\"", "recorder.log");
+        }
+        catch (Exception ex)
+        {
+            // Never let session.json fail take down audio recording.
+            Debug.WriteLine($"session.json write failed: {ex}");
+            LogVideo($"session.json write failed: {ex.Message}", "recorder.log");
         }
     }
 
