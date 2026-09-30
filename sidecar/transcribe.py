@@ -36,6 +36,7 @@ import html
 import json
 import math
 import os
+import re
 import site
 import subprocess
 import sys
@@ -471,6 +472,19 @@ def write_transcript_vtt(out_dir: Path, result: dict) -> Path:
     return vtt_path
 
 
+def load_session_title(out_dir: Path) -> str | None:
+    """Return the title from <out_dir>/session.json, or None when the file is
+    missing, unreadable, or has no title. Never raises.
+    """
+    try:
+        with open(Path(out_dir) / "session.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    title = data.get("title") if isinstance(data, dict) else None
+    return title if isinstance(title, str) and title else None
+
+
 def write_meeting_html(out_dir: Path, result: dict) -> Path:
     """Render <out_dir>/meeting.html — the self-contained meeting page.
 
@@ -482,7 +496,9 @@ def write_meeting_html(out_dir: Path, result: dict) -> Path:
     because they land inside a <script> block.
     """
     out_dir = Path(out_dir)
-    title = result.get("title") or out_dir.name
+    # Prefer the title the recorder parsed at session start; fall back to the
+    # transcript's title (folder name by default), then the folder name itself.
+    title = load_session_title(out_dir) or result.get("title") or out_dir.name
     data = {
         "title": title,
         "created": result.get("created"),
@@ -521,7 +537,127 @@ def write_meeting_html(out_dir: Path, result: dict) -> Path:
     with open(page_path, "w", encoding="utf-8", newline="") as f:
         f.write(page)
     log(f"Wrote {page_path}")
+    # Refresh the recordings-root library page (best-effort: a failure here
+    # must never fail the caller, which just finished writing the transcript).
+    try:
+        write_library(out_dir.parent)
+    except Exception as exc:
+        log(f"library: refresh failed: {exc}")
     return page_path
+
+
+# Session folder names are yyyy-MM-dd_HHmm (see Recorder.cs); anything else in
+# the recordings root (e2e-test, e2e-test2, ...) is not a session and is skipped.
+_SESSION_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{4}$")
+
+
+def write_library(root: Path) -> Path:
+    """Render <root>/library.html — the read-only meetings library page.
+
+    Scans <root> for session folders (yyyy-MM-dd_HHmm, newest first) and
+    substitutes the session list and a generation timestamp into
+    sidecar/library_template.html. Tolerates missing/corrupt per-session JSON:
+    such folders are still listed, with nulls and an empty utterance list.
+    Written atomically (library.html.tmp + os.replace).
+    """
+    root = Path(root)
+    sessions: list[dict] = []
+    for name in sorted((d.name for d in root.iterdir()
+                        if d.is_dir() and _SESSION_DIR_RE.match(d.name)),
+                       reverse=True):
+        session_dir = root / name
+        entry: dict = {
+            "folder": name,
+            "title": load_session_title(session_dir),
+            "started": None,
+            "duration_sec": None,
+            "speakers": [],
+            "has_video": False,
+            "link": None,
+            "utterances": [],
+        }
+
+        # session.json: title + startedLocal. A MISSING file is normal for
+        # older sessions (before session.json was introduced) — not an error;
+        # only log when the file exists but fails to parse.
+        session_json_path = session_dir / "session.json"
+        if session_json_path.exists():
+            try:
+                with open(session_json_path, "r", encoding="utf-8") as f:
+                    sj = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                log(f"library: {name}: session.json unreadable: {exc}")
+            else:
+                if isinstance(sj, dict):
+                    if entry["title"] is None:
+                        t = sj.get("title")
+                        if isinstance(t, str) and t:
+                            entry["title"] = t
+                    sl = sj.get("startedLocal")
+                    if isinstance(sl, str) and sl:
+                        entry["started"] = sl
+
+        # transcript.json: duration, speakers, utterances (3 keys each).
+        # A missing file is normal (not yet transcribed) — not an error.
+        transcript_json_path = session_dir / "transcript.json"
+        if transcript_json_path.exists():
+            try:
+                with open(transcript_json_path, "r", encoding="utf-8") as f:
+                    tj = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                log(f"library: {name}: transcript.json unreadable: {exc}")
+            else:
+                if isinstance(tj, dict):
+                    d = tj.get("duration_sec")
+                    if isinstance(d, (int, float)):
+                        entry["duration_sec"] = d
+                    sp = tj.get("speakers")
+                    if isinstance(sp, list):
+                        entry["speakers"] = [s for s in sp if isinstance(s, str)]
+                    utts = tj.get("utterances")
+                    if isinstance(utts, list):
+                        entry["utterances"] = [
+                            {"start": u.get("start"),
+                             "speaker": u.get("speaker"),
+                             "text": u.get("text")}
+                            for u in utts if isinstance(u, dict)
+                        ]
+
+        # video + link (meeting.html > transcript.md > none)
+        entry["has_video"] = ((session_dir / "meeting.mp4").exists()
+                              or (session_dir / "video.mp4").exists())
+        if (session_dir / "meeting.html").exists():
+            entry["link"] = f"{name}/meeting.html"
+        elif (session_dir / "transcript.md").exists():
+            entry["link"] = f"{name}/transcript.md"
+
+        sessions.append(entry)
+
+    template = (Path(__file__).resolve().parent / "library_template.html") \
+        .read_text(encoding="utf-8-sig")
+
+    def payload(obj) -> str:
+        return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+
+    generated = datetime.now().astimezone().isoformat(timespec="seconds")
+    page = template.replace("__LIBRARY__", payload(sessions)) \
+                   .replace("__GENERATED__", payload(generated))
+    page_path = root / "library.html"
+    tmp_path = page_path.with_suffix(".html.tmp")
+    with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+        f.write(page)
+    os.replace(tmp_path, page_path)
+    log(f"Wrote {page_path} ({len(sessions)} sessions)")
+    return page_path
+
+
+def cmd_library(args) -> int:
+    root = Path(args.root)
+    if not root.is_dir():
+        print(f"error: recordings root not found: {root}", file=sys.stderr)
+        return 1
+    write_library(root)
+    return 0
 
 
 def transcript_result(args, model_name: str, paul_utterances: list,
@@ -1240,6 +1376,13 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--ffmpeg",
                     default=DEFAULT_FFMPEG,
                     help=f"Path to ffmpeg.exe (default: {DEFAULT_FFMPEG}).")
+    lp = sub.add_parser(
+        "library",
+        help="Regenerate <root>\\library.html, the read-only meetings library "
+             "page (no GPU needed).")
+    lp.add_argument("--root", required=True,
+                    help="Recordings root containing the yyyy-MM-dd_HHmm "
+                         "session folders.")
     return parser
 
 
@@ -1261,6 +1404,12 @@ def main() -> int:
             print("error: mux requires --session", file=sys.stderr)
             return 1
         return cmd_mux(args)
+
+    if args.command == "library":
+        if not args.root:
+            print("error: library requires --root", file=sys.stderr)
+            return 1
+        return cmd_library(args)
 
     # default: normal transcription mode
     missing = [a for a in ("mic", "loopback", "out") if not getattr(args, a)]

@@ -183,4 +183,75 @@ public static class SidecarRunner
             }
         });
     }
+
+    /// <summary>
+    /// Runs the sidecar's <c>library</c> subcommand on a background thread:
+    /// <c>PythonExe SidecarScript library --root &lt;root&gt;</c>. stdout/stderr are
+    /// appended to <c>&lt;root&gt;\library.log</c> (there is no session folder for
+    /// this command; the log lives next to the library.html it produces).
+    /// Returns the exit code; -1 if the process could not be started or crashed.
+    /// </summary>
+    public static Task<int> LibraryAsync(
+        Settings s,
+        string recordingsRoot)
+    {
+        return Task.Run(() =>
+        {
+            Process? process = null;
+            TextWriter? stdout = null;
+            TextWriter? stderr = null;
+            try
+            {
+                var logPath = Path.Combine(recordingsRoot, "library.log");
+                // Single shared writer (see TryStart).
+                stdout = TextWriter.Synchronized(new StreamWriter(logPath, append: true) { AutoFlush = true });
+                stderr = stdout;
+                stdout.WriteLine($"\n--- library {DateTime.Now:yyyy-MM-dd HH:mm:ss} ---");
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = s.PythonExe,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Path.GetDirectoryName(s.SidecarScript) ?? recordingsRoot,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                psi.ArgumentList.Add(s.SidecarScript);
+                psi.ArgumentList.Add("library");
+                psi.ArgumentList.Add("--root");
+                psi.ArgumentList.Add(recordingsRoot);
+
+                process = new Process { StartInfo = psi };
+                process.OutputDataReceived += (_, e) =>
+                {
+                    if (e.Data is not null)
+                        stdout.WriteLine(e.Data);
+                };
+                process.ErrorDataReceived += (_, e) =>
+                {
+                    if (e.Data is not null)
+                        stderr.WriteLine(e.Data);
+                };
+
+                if (!process.Start())
+                    return -1;
+
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                process.WaitForExit();
+                return process.ExitCode;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"TeamsRecorder: library failed ({ex.Message}).");
+                return -1;
+            }
+            finally
+            {
+                stdout?.Dispose();
+                process?.Dispose();
+            }
+        });
+    }
 }

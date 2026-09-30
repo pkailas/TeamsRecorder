@@ -19,6 +19,7 @@ public sealed class TrayContext : ApplicationContext
     private readonly ToolStripMenuItem _retranscribeItem;
     private readonly ToolStripMenuItem _openMeetingItem;
     private readonly ToolStripMenuItem _openTranscriptItem;
+    private readonly ToolStripMenuItem _openLibraryItem;
     private readonly ToolStripMenuItem _startWithWindowsItem;
     private DateTime _startedAt;
     private WindowCapture? _videoCapture;
@@ -82,6 +83,9 @@ public sealed class TrayContext : ApplicationContext
         };
         _openMeetingItem.Click += (_, _) => OpenLastMeeting();
 
+        _openLibraryItem = new ToolStripMenuItem("Open meetings library");
+        _openLibraryItem.Click += (_, _) => OpenLibrary();
+
         _openTranscriptItem = new ToolStripMenuItem("Open last transcript")
         {
             Enabled = false,
@@ -112,6 +116,7 @@ public sealed class TrayContext : ApplicationContext
         menu.Items.Add(_nameSpeakersItem);
         menu.Items.Add(_retranscribeItem);
         menu.Items.Add(_openMeetingItem);
+        menu.Items.Add(_openLibraryItem);
         menu.Items.Add(_openTranscriptItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(openFolderItem);
@@ -726,6 +731,41 @@ public sealed class TrayContext : ApplicationContext
             return;
 
         OpenInShell(html);
+    }
+
+    /// <summary>
+    /// Opens <c>&lt;OutputFolder&gt;\library.html</c> in the default browser (context
+    /// menu). When the page does not exist yet, runs the sidecar's <c>library</c>
+    /// subcommand in the background and opens it on success.
+    /// </summary>
+    private void OpenLibrary()
+    {
+        var root = _settings.OutputFolder;
+        var library = Path.Combine(root, "library.html");
+
+        if (File.Exists(library))
+        {
+            OpenInShell(library);
+            return;
+        }
+
+        ShowBalloon("Building meetings library…", "Running sidecar library.");
+        _ = Task.Run(async () =>
+        {
+            var exitCode = await SidecarRunner.LibraryAsync(_settings, root);
+            _uiContext?.Post(_ =>
+            {
+                if (exitCode == 0 && File.Exists(library))
+                {
+                    OpenInShell(library);
+                }
+                else
+                {
+                    ShowBalloon("Meetings library unavailable — see library.log",
+                        Path.Combine(root, "library.log"));
+                }
+            }, null);
+        });
     }
 
     /// <summary>Opens the most recent transcript.md with the default app (context menu).</summary>

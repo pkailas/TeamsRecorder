@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meetings</title>
+<style>
+  :root {
+    --bg: #f6f7fb; --panel: #ffffff; --ink: #1f2330; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #4f46e5; --accent-soft: #eef2ff; --hit: #fef3c7; --warn: #b45309;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1117; --panel: #171a23; --ink: #e5e7eb; --muted: #9ca3af; --line: #2a2f3d; --accent: #818cf8; --accent-soft: #1e2140; --hit: #4a3a0a; --warn: #f59e0b; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; white-space: nowrap; }
+  header input { flex: 1; max-width: 520px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
+  header .count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  main { max-width: 960px; margin: 0 auto; padding: 8px 16px 32px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 20px 0 6px; font-weight: 600; }
+  .row { display: block; padding: 10px 12px; margin: 0 0 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; color: inherit; text-decoration: none; }
+  a.row:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .row .t { font-weight: 600; overflow-wrap: anywhere; }
+  .row .t.dated { color: var(--muted); font-weight: 500; }
+  .row .meta { color: var(--muted); font-size: 12px; margin-top: 2px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
+  .badge { font-size: 11px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--line); }
+  .badge.warn { color: var(--warn); border-color: currentColor; }
+  .snip { margin-top: 6px; font-size: 13px; color: var(--ink); opacity: .9; }
+  .snip .who { font-weight: 600; margin-right: 4px; }
+  mark { background: var(--hit); color: inherit; padding: 0 1px; border-radius: 2px; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  footer { color: var(--muted); font-size: 11px; text-align: center; padding: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Meetings</h1>
+  <input id="q" type="search" placeholder="Search titles, speakers, transcripts…  ( / )" autocomplete="off">
+  <span class="count" id="count"></span>
+</header>
+<main id="list"></main>
+<footer id="gen"></footer>
+<script>
+// The sidecar substitutes the two tokens below.
+// LIB: array of sessions, newest first:
+//   { folder, title|null, started|null, duration_sec|null, speakers:[], has_video, link|null,
+//     utterances:[{start, speaker, text}] }   (utterances omitted/empty when there is no transcript)
+const LIB = __LIBRARY__;
+const GENERATED = __GENERATED__;
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const dur = t => { if (t == null) return null; t = Math.round(t); const h = (t/3600)|0, m = ((t%3600)/60)|0; return h ? `${h} h ${m} min` : m ? `${m} min` : `${t} s`; };
+const fmtTs = t => { t = Math.max(0, t|0); const h = (t/3600)|0, m = ((t%3600)/60)|0, s = t%60; return (h ? h + ':' : '') + String(m).padStart(h?2:1,'0') + ':' + String(s).padStart(2,'0'); };
+
+// Session date: prefer session.json startedLocal; else parse the yyyy-MM-dd_HHmm folder name.
+function when(s) {
+  if (s.started) { const d = new Date(s.started); if (!isNaN(d)) return d; }
+  const m = /^(\d{4})-(\d{2})-(\d{2})_(\d{2})(\d{2})/.exec(s.folder);
+  return m ? new Date(+m[1], m[2]-1, +m[3], +m[4], +m[5]) : null;
+}
+const dateLabel = d => d ? d.toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : null;
+const monthLabel = d => d ? d.toLocaleString(undefined, { month: 'long', year: 'numeric' }) : 'Undated';
+
+for (const s of LIB) {
+  s._when = when(s);
+  s._utts = s.utterances || [];
+  s._head = [s.title || '', ...(s.speakers || [])].join(' \n ').toLowerCase();
+  s._utts.forEach(u => u._lc = (u.text || '').toLowerCase());
+}
+
+function hl(text, terms) {
+  let out = esc(text);
+  for (const t of terms) {
+    if (!t) continue;
+    const re = new RegExp(esc(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    out = out.replace(re, m => `<mark>${m}</mark>`);
+  }
+  return out;
+}
+
+function render() {
+  const q = $('#q').value.trim().toLowerCase();
+  const terms = q ? q.split(/\s+/) : [];
+  const list = $('#list');
+  let html = '', shown = 0, lastMonth = null;
+
+  for (const s of LIB) {
+    // Every term must appear in the title/speakers or somewhere in the transcript.
+    let snip = null;
+    if (terms.length) {
+      const all = terms.every(t => s._head.includes(t) || s._utts.some(u => u._lc.includes(t)));
+      if (!all) continue;
+      const bodyTerms = terms.filter(t => !s._head.includes(t));
+      const probe = bodyTerms.length ? bodyTerms : terms;
+      const u = s._utts.find(u => probe.some(t => u._lc.includes(t)));
+      if (u) {
+        const t = probe.find(t => u._lc.includes(t));
+        const i = u._lc.indexOf(t), a = Math.max(0, i - 80), b = Math.min(u.text.length, i + t.length + 80);
+        snip = { ts: u.start, who: u.speaker, text: (a ? '…' : '') + u.text.slice(a, b) + (b < u.text.length ? '…' : '') };
+      }
+    }
+    shown++;
+
+    const month = monthLabel(s._when);
+    if (month !== lastMonth) { html += `<h2>${esc(month)}</h2>`; lastMonth = month; }
+
+    const date = dateLabel(s._when) || s.folder;
+    const title = s.title ? `<div class="t">${hl(s.title, terms)}</div>` : `<div class="t dated">${esc(date)}</div>`;
+    const meta = [];
+    if (s.title) meta.push(esc(date));
+    const d = dur(s.duration_sec); if (d) meta.push(esc(d));
+    if (s.speakers && s.speakers.length) meta.push(hl(s.speakers.join(', '), terms));
+    if (s.has_video) meta.push('<span class="badge">video</span>');
+    if (!s.link) meta.push('<span class="badge warn">no transcript</span>');
+    const snipHtml = snip ? `<div class="snip">${esc(fmtTs(snip.ts))} · <span class="who">${esc(snip.who || '')}</span>${hl(snip.text, terms)}</div>` : '';
+    const inner = `${title}<div class="meta">${meta.join('<span>·</span>')}</div>${snipHtml}`;
+    html += s.link
+      ? `<a class="row" href="${esc(encodeURI(s.link))}">${inner}</a>`
+      : `<div class="row">${inner}</div>`;
+  }
+
+  list.innerHTML = html || `<div class="empty">${LIB.length ? 'No meetings match.' : 'No recordings yet.'}</div>`;
+  $('#count').textContent = terms.length ? `${shown} of ${LIB.length}` : `${LIB.length} meeting${LIB.length === 1 ? '' : 's'}`;
+}
+
+$('#q').addEventListener('input', render);
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && document.activeElement !== $('#q')) { e.preventDefault(); $('#q').focus(); }
+  if (e.key === 'Escape' && document.activeElement === $('#q')) { $('#q').value = ''; render(); }
+});
+if (GENERATED) $('#gen').textContent = 'Generated ' + new Date(GENERATED).toLocaleString();
+render();
+</script>
+</body>
+</html>
