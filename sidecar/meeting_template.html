@@ -39,6 +39,12 @@
   .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
   .chip.off { opacity: .4; }
   .chip .t { color: var(--muted); }
+  .chip .ed { opacity: .45; font-size: 11px; margin-left: 2px; }
+  .chip:hover .ed { opacity: 1; }
+  .chip input { font: inherit; width: 11ch; padding: 1px 4px; border: 1px solid var(--accent); border-radius: 4px; background: var(--bg); color: var(--ink); }
+  #save { display: none; background: var(--accent); color: #fff; border-color: var(--accent); }
+  #save.show { display: inline-block; }
+  .hint { color: var(--muted); font-size: 12px; }
   .lines { overflow-y: auto; padding: 6px 0; scroll-behavior: smooth; }
   .line { display: grid; grid-template-columns: 62px 1fr; gap: 10px; padding: 6px 12px; cursor: pointer; border-left: 3px solid transparent; }
   .line:hover { background: var(--accent-soft); }
@@ -56,7 +62,7 @@
     <h1 id="title"></h1>
     <span class="meta" id="meta"></span>
     <span class="spacer"></span>
-    <span class="meta">Space: play/pause · ←/→: ±5 s · J/K: prev/next line · / : search</span>
+    <span class="meta">Click ✎ on a speaker to rename · Space: play/pause · ←/→: ±5 s · J/K: prev/next line · / : search</span>
   </header>
   <div class="main">
     <section class="video">
@@ -67,6 +73,7 @@
         <a id="dl-md" download>transcript.md</a>
         <a id="dl-srt" download>transcript.srt</a>
         <a id="dl-json" download>transcript.json</a>
+        <button id="save" title="Send the new names to Teams Recorder (updates the transcript files and remembers the voices)">Save names</button>
       </div>
     </section>
     <aside class="side">
@@ -98,7 +105,7 @@ let video = null;
 if (FILES.video) {
   video = document.createElement('video');
   video.controls = true; video.preload = 'metadata'; video.src = FILES.video;
-  if (FILES.srt) { const tr = document.createElement('track'); tr.kind = 'subtitles'; tr.label = 'Transcript'; tr.srclang = 'en'; tr.src = FILES.vtt || ''; if (FILES.vtt) video.appendChild(tr); }
+  if (FILES.srt) { const tr = document.createElement('track'); tr.kind = 'subtitles'; tr.label = 'Transcript'; tr.srclang = 'en'; tr.src = FILES.vtt || ''; if (FILES.vtt) { tr.addEventListener('load', refreshCaptions); video.appendChild(tr); } }
   $('#player').appendChild(video);
 } else {
   const d = document.createElement('div'); d.className = 'novideo'; d.textContent = 'No video for this meeting — transcript only.'; $('#player').appendChild(d);
@@ -111,12 +118,44 @@ const color = {}; speakers.forEach((s, i) => color[s] = `var(--sp${i % 8})`);
 const talk = {}; (DATA.utterances || []).forEach(u => talk[u.speaker] = (talk[u.speaker] || 0) + (u.end - u.start));
 const enabled = new Set(speakers);
 const spBox = $('#speakers');
+// Renames made on this page (original label -> new name), applied live and sent to the app on Save.
+const renames = {};
+const shown = s => renames[s] || s;
+const chips = {};
 speakers.forEach(s => {
-  const c = document.createElement('span'); c.className = 'chip'; c.dataset.s = s;
-  c.innerHTML = `<span class="dot" style="background:${color[s]}"></span>${esc(s)} <span class="t">${fmt(talk[s])}</span>`;
-  c.onclick = e => { if (e.shiftKey) { enabled.clear(); enabled.add(s); } else { enabled.has(s) ? enabled.delete(s) : enabled.add(s); if (!enabled.size) speakers.forEach(x => enabled.add(x)); } render(); };
+  const c = document.createElement('span'); c.className = 'chip'; c.dataset.s = s; chips[s] = c;
+  const paint = () => { c.innerHTML = `<span class="dot" style="background:${color[s]}"></span><span class="nm">${esc(shown(s))}</span> <span class="t">${fmt(talk[s])}</span><span class="ed" title="Rename this speaker">✎</span>`; };
+  paint();
+  c.onclick = e => {
+    if (e.target.classList.contains('ed')) { e.stopPropagation(); editChip(s, c, paint); return; }
+    if (e.shiftKey) { enabled.clear(); enabled.add(s); } else { enabled.has(s) ? enabled.delete(s) : enabled.add(s); if (!enabled.size) speakers.forEach(x => enabled.add(x)); }
+    render();
+  };
+  c.ondblclick = e => { e.preventDefault(); editChip(s, c, paint); };
   spBox.appendChild(c);
 });
+function editChip(s, chip, paint) {
+  const nm = chip.querySelector('.nm'); if (!nm) return;
+  const inp = document.createElement('input'); inp.value = shown(s); inp.placeholder = 'Name';
+  nm.replaceWith(inp); inp.focus(); inp.select();
+  let done = false;
+  const finish = commit => {
+    if (done) return; done = true;
+    const v = inp.value.trim();
+    if (commit && v && v !== s && !v.includes('=')) renames[s] = v; else if (commit && v === s) delete renames[s];
+    paint(); applyRenames();
+  };
+  inp.onkeydown = e => { if (e.key === 'Enter') finish(true); else if (e.key === 'Escape') finish(false); e.stopPropagation(); };
+  inp.onblur = () => finish(true);
+  inp.onclick = e => e.stopPropagation();
+}
+function applyRenames() {
+  rows.forEach((r, i) => { const w = r.querySelector('.who'); if (w) w.textContent = shown(DATA.utterances[i].speaker); });
+  const n = Object.keys(renames).length;
+  $('#save').classList.toggle('show', n > 0);
+  $('#save').textContent = n ? `Save ${n} name${n === 1 ? '' : 's'}` : 'Save names';
+  if (video) refreshCaptions();
+}
 
 // ---- transcript ----
 const lines = $('#lines'); const rows = [];
@@ -134,7 +173,7 @@ function render() {
   rows.forEach((r, i) => {
     const u = DATA.utterances[i];
     const okSp = enabled.has(u.speaker);
-    const okQ = !needle || u.text.toLowerCase().includes(needle) || u.speaker.toLowerCase().includes(needle);
+    const okQ = !needle || u.text.toLowerCase().includes(needle) || u.speaker.toLowerCase().includes(needle) || shown(u.speaker).toLowerCase().includes(needle);
     r.classList.toggle('hide', !(okSp && okQ));
     const txt = r.querySelector('.txt');
     if (needle && okSp && okQ) { hits++; const re = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig'); txt.innerHTML = esc(u.text).replace(re, m => `<mark>${m}</mark>`); }
@@ -179,9 +218,24 @@ document.addEventListener('keydown', e => {
   }
 });
 
+// ---- save names → the app (teamsrecorder:// protocol, handled by the tray app) ----
+$('#save').onclick = () => {
+  const pairs = Object.entries(renames);
+  if (!pairs.length || !FILES.session) return;
+  const qs = ['session=' + encodeURIComponent(FILES.session)].concat(pairs.map(([a, b]) => 'assign=' + encodeURIComponent(a + '=' + b)));
+  $('#save').textContent = 'Saving…';
+  location.href = 'teamsrecorder://rename?' + qs.join('&');
+  setTimeout(() => { $('#save').textContent = 'Sent — the page will reopen with the new names'; }, 1500);
+};
+// Captions: rebuild the <track> cues with the live names so the video matches the transcript.
+function refreshCaptions() {
+  const tt = video.textTracks[0]; if (!tt || !tt.cues) return;
+  for (const cue of tt.cues) { for (const [a, b] of Object.entries(renames)) { cue.text = cue.text.replace(new RegExp('<v ' + a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '>', 'g'), '<v ' + b + '>'); } }
+}
+
 // ---- copy ----
 $('#copy').onclick = async () => {
-  const txt = rows.filter(r => !r.classList.contains('hide')).map(r => { const u = DATA.utterances[+r.dataset.i]; return `[${fmt(u.start)}] ${u.speaker}: ${u.text}`; }).join('\n');
+  const txt = rows.filter(r => !r.classList.contains('hide')).map(r => { const u = DATA.utterances[+r.dataset.i]; return `[${fmt(u.start)}] ${shown(u.speaker)}: ${u.text}`; }).join('\n');
   try { await navigator.clipboard.writeText(txt); $('#copy').textContent = 'Copied'; setTimeout(() => $('#copy').textContent = 'Copy transcript', 1200); } catch { alert('Copy failed'); }
 };
 </script>

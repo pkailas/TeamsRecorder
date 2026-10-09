@@ -1,8 +1,11 @@
+using Microsoft.Win32;
+
 namespace TeamsRecorder;
 
 /// <summary>
-/// Static helpers for the "Start with Windows" autostart shortcut and the
-/// Start Menu (Programs) shortcut. Shortcuts are written as .lnk files via
+/// Static helpers for the "Start with Windows" autostart shortcut, the
+/// Start Menu (Programs) shortcut, and the <c>teamsrecorder://</c> protocol handler.
+/// Shortcuts are written as .lnk files via
 /// the late-bound <c>WScript.Shell</c> COM object, so no extra packages are
 /// needed (System.Runtime.InteropServices + Microsoft.CSharp for <c>dynamic</c>,
 /// both part of the shared framework).
@@ -62,6 +65,54 @@ public static class Shortcuts
             return;
 
         CreateShortcut(StartMenuLinkPath, ExePath);
+    }
+
+    /// <summary>Registry key (per-user, no admin needed) that declares the protocol.</summary>
+    private const string ProtocolKeyPath = @"Software\Classes\teamsrecorder";
+
+    /// <summary>
+    /// Registers the <c>teamsrecorder://</c> protocol under HKCU\Software\Classes so
+    /// browsers can hand meeting-page "Save names" URLs back to this exe. Rewrites
+    /// the keys when the stored command points at a different exe than
+    /// <see cref="ExePath"/> (same staleness rule as <see cref="EnsureStartMenuShortcut"/>).
+    /// Throws on failure; the startup call site swallows it as best-effort.
+    /// </summary>
+    public static void EnsureProtocolHandler()
+    {
+        var command = "\"" + ExePath + "\" \"%1\"";
+
+        // Registry.CurrentUser is a shared root key: never disposed here.
+        using var key = Registry.CurrentUser.CreateSubKey(ProtocolKeyPath, writable: true)
+            ?? throw new InvalidOperationException(
+                $"Failed to open/create HKCU\\{ProtocolKeyPath}.");
+
+        // Staleness check first: identical command means nothing to do. The stored
+        // command lives in the shell\open\command SUBKEY's default value, so it is
+        // read from that subkey (a value name of "shell\open\command" does not exist).
+        string? stored = null;
+        using var probe = key.OpenSubKey(@"shell\open\command");
+        stored = probe?.GetValue(null) as string;
+        if (stored == command)
+            return;
+
+        key.SetValue(null, "URL:TeamsRecorder Protocol");
+        key.SetValue("URL Protocol", string.Empty);
+
+        using var icon = key.CreateSubKey("DefaultIcon", writable: true);
+        icon?.SetValue(null, $"\"{ExePath}\",0");
+
+        using var open = key.CreateSubKey(@"shell\open\command", writable: true);
+        open?.SetValue(null, command);
+    }
+
+    /// <summary>
+    /// The command currently stored by <see cref="EnsureProtocolHandler"/>, or null
+    /// when the protocol is not registered. Used by the --register-protocol CLI switch.
+    /// </summary>
+    public static string? ReadProtocolCommand()
+    {
+        using var open = Registry.CurrentUser.OpenSubKey(ProtocolKeyPath + @"\shell\open\command");
+        return open?.GetValue(null) as string;
     }
 
     /// <summary>

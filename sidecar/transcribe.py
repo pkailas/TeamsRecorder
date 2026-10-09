@@ -523,6 +523,9 @@ def write_meeting_html(out_dir: Path, result: dict) -> Path:
         "srt": "transcript.srt",
         "json": "transcript.json",
         "vtt": "transcript.vtt" if (out_dir / "transcript.vtt").exists() else None,
+        # Absolute session folder: the page's "Save names" sends it back to the app
+        # via the teamsrecorder:// protocol (the app rejects paths outside OutputFolder).
+        "session": str(out_dir.resolve()),
     }
     template = (Path(__file__).resolve().parent / "meeting_template.html") \
         .read_text(encoding="utf-8-sig")

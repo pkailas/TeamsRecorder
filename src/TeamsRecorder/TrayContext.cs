@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.IO.Pipes;
+using System.Text;
 
 namespace TeamsRecorder;
 
@@ -38,6 +40,18 @@ public sealed class TrayContext : ApplicationContext
     private bool _transcriptionRunning;
 
     /// <summary>
+    /// Named pipe a second process instance uses to hand a teamsrecorder://rename URL
+    /// to the already-running instance (see <see cref="Program"/>).
+    /// </summary>
+    public const string RenamePipeName = "TeamsRecorder.Rename";
+
+    /// <summary>Stops the rename pipe listener when the app exits.</summary>
+    private readonly CancellationTokenSource _renamePipeCts = new();
+
+    /// <summary>teamsrecorder:// URL the app was launched with, if any.</summary>
+    private readonly string? _pendingUrl;
+
+    /// <summary>
     /// File to open when the "Transcript ready" balloon is clicked (set by that
     /// balloon; cleared on click and by every other balloon). Null = no action.
     /// </summary>
@@ -54,9 +68,14 @@ public sealed class TrayContext : ApplicationContext
         return new Icon(stream, 16, 16);
     }
 
-    public TrayContext()
+    /// <param name="pendingUrl">
+    /// A <c>teamsrecorder://rename?...</c> URL the app was started with (no instance was
+    /// running, so the browser launched this one). Processed once the UI is up.
+    /// </param>
+    public TrayContext(string? pendingUrl = null)
     {
         _settings = Settings.Load();
+        _pendingUrl = pendingUrl;
 
         // --- Context menu ---
         _startItem = new ToolStripMenuItem("Start recording");
@@ -140,9 +159,14 @@ public sealed class TrayContext : ApplicationContext
         _notifyIcon.DoubleClick += (_, _) => ToggleRecording();
         _notifyIcon.BalloonTipClicked += OnBalloonTipClicked;
 
-        // Make sure the Start Menu (Programs) entry points at this exe, even
-        // after a rebuild moved it. Failures are silent — this is best-effort.
-        try { Shortcuts.EnsureStartMenuShortcut(); }
+        // Make sure the Start Menu (Programs) entry and the teamsrecorder:// protocol
+        // handler point at this exe, even after a rebuild moved it. Failures are
+        // silent — this is best-effort.
+        try
+        {
+            Shortcuts.EnsureStartMenuShortcut();
+            Shortcuts.EnsureProtocolHandler();
+        }
         catch { /* best-effort on startup */ }
 
         // --- Hotkey ---
@@ -168,6 +192,11 @@ public sealed class TrayContext : ApplicationContext
         _timer = new System.Windows.Forms.Timer { Interval = 1000 };
         _timer.Tick += (_, _) => UpdateTooltip();
         _timer.Start();
+
+        // --- teamsrecorder://rename hand-offs ---
+        StartRenamePipeServer();
+        if (_pendingUrl is not null)
+            _uiContext?.Post(_ => HandleRenameUrl(_pendingUrl), null);
     }
 
     private void ToggleRecording()
@@ -460,6 +489,7 @@ public sealed class TrayContext : ApplicationContext
                 return;
         }
 
+        _renamePipeCts.Cancel();
         _timer.Stop();
         _hotkeys.Dispose();
         _recorder.Dispose();
@@ -642,6 +672,17 @@ public sealed class TrayContext : ApplicationContext
         // reference the form after this method returns.
         var assignments = form.Assignments;
 
+        RunRename(sessionFolder, assignments);
+    }
+
+    /// <summary>
+    /// Runs the sidecar's rename subcommand in the background for an already-decided
+    /// set of assignments (voice enrollment + regenerating meeting.html/.md/.srt/.vtt)
+    /// and reports the result via balloon. Shared by the naming dialog and by
+    /// teamsrecorder://rename URLs handed over from a meeting page. Call on the UI thread.
+    /// </summary>
+    private void RunRename(string sessionFolder, IReadOnlyList<(string label, string name)> assignments)
+    {
         ShowBalloon("Naming speakers…", $"{assignments.Count} speaker(s) — running sidecar rename.");
         _ = Task.Run(async () =>
         {
@@ -669,6 +710,68 @@ public sealed class TrayContext : ApplicationContext
                 }
             }, null);
         });
+    }
+
+    /// <summary>
+    /// Listens on <see cref="RenamePipeName"/> for URLs written by second process
+    /// instances; each line is handed to the UI thread. Stops when the app exits.
+    /// </summary>
+    private void StartRenamePipeServer()
+    {
+        _ = Task.Run(async () =>
+        {
+            var token = _renamePipeCts.Token;
+            while (!token.IsCancellationRequested)
+            {
+                string? url = null;
+                try
+                {
+                    using var pipe = new NamedPipeServerStream(
+                        RenamePipeName, PipeDirection.In, 1,
+                        PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                    await pipe.WaitForConnectionAsync(token);
+                    using var reader = new StreamReader(pipe, Encoding.UTF8);
+                    url = await reader.ReadLineAsync();
+                }
+                catch (OperationCanceledException)
+                {
+                    break; // App is exiting.
+                }
+                catch (IOException)
+                {
+                    continue; // Client disconnected mid-write; wait for the next one.
+                }
+
+                if (url is not null)
+                    _uiContext?.Post(_ => HandleRenameUrl(url), null);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Handles one teamsrecorder://rename URL on the UI thread: validates it, adopts
+    /// the session it names, and runs the rename. Invalid URLs are ignored with a
+    /// balloon — a browser-supplied URL is never trusted to name a folder.
+    /// </summary>
+    private void HandleRenameUrl(string url)
+    {
+        var request = RenameRequest.TryParse(url);
+        if (request is null)
+        {
+            ShowBalloon("Rename request ignored (invalid)", url);
+            return;
+        }
+
+        // Adopt the session the page just renamed, so the post-rename UI code (menu
+        // items, transcript state) operates on it rather than on the previous session.
+        _lastSessionFolder = request.SessionFolder;
+        _lastTranscript = TranscriptInfo.Load(request.SessionFolder);
+        _nameSpeakersItem.Enabled = _lastTranscript is { } t && t.Unnamed.Any();
+        _retranscribeItem.Enabled = true;
+        _openTranscriptItem.Enabled = File.Exists(Path.Combine(request.SessionFolder, "transcript.md"));
+        _openMeetingItem.Enabled = File.Exists(Path.Combine(request.SessionFolder, "meeting.html"));
+
+        RunRename(request.SessionFolder, request.Assignments);
     }
 
     /// <summary>Re-runs the sidecar transcription on the last session's WAV files (context menu).</summary>

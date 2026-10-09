@@ -75,6 +75,14 @@ tray menu item, clicking the **"Transcript ready"** balloon (its text becomes
 "Click to open the meeting page"), or automatically — as soon as you save the
 **Name speakers** dialog, the freshly renamed page opens in your browser.
 
+Renaming from the page itself uses the **`teamsrecorder://`** protocol: the page's
+**Save names** button navigates to `teamsrecorder://rename?session=…&assign=…`, which the
+app registers under your user account (`HKCU\Software\Classes`) every time it starts — no
+admin rights needed. If your browser asks for permission to open Teams Recorder for that
+link, allow it. The app runs the same sidecar rename the dialog runs (voice enrollment,
+regenerating `meeting.html`/`.md`/`.srt`/`.vtt`) and reopens the refreshed page. Sessions
+outside your recordings folder are ignored.
+
 ## Publish (recommended way to run it)
 
 ```powershell

@@ -1,3 +1,6 @@
+using System.IO.Pipes;
+using System.Text;
+
 namespace TeamsRecorder;
 
 /// <summary>
@@ -18,6 +21,33 @@ internal static class Program
             return;
         }
 
+        // Hidden CLI switches used for verification (see README notes in code):
+        //   --parse-url <url>        prints the parsed RenameRequest (or "null") and exits
+        //   --register-protocol      registers teamsrecorder:// and prints the command
+        if (args.Length == 2 && args[0] == "--parse-url")
+        {
+            RunParseUrl(args[1]);
+            return;
+        }
+
+        if (args.Length == 1 && args[0] == "--register-protocol")
+        {
+            RunRegisterProtocol();
+            return;
+        }
+
+        // A meeting page's "Save names" click arrives as a teamsrecorder:// URL. If an
+        // instance is already running, hand the URL over the named pipe and exit; if the
+        // app is not running, fall through to normal startup and let TrayContext process
+        // the URL once its UI is up.
+        string? pendingUrl = null;
+        if (args.Length == 1 && args[0].StartsWith("teamsrecorder://", StringComparison.OrdinalIgnoreCase))
+        {
+            if (TryHandOffRenameUrl(args[0]))
+                return;
+            pendingUrl = args[0];
+        }
+
         ApplicationConfiguration.Initialize();
 
         // Single instance: if a previous instance is still running, exit quietly.
@@ -25,7 +55,55 @@ internal static class Program
         if (!createdNew)
             return;
 
-        Application.Run(new TrayContext());
+        Application.Run(new TrayContext(pendingUrl));
+    }
+
+    /// <summary>
+    /// Writes <paramref name="url"/> to the running instance's rename pipe.
+    /// Returns false when no server is listening (the app is not running), in which
+    /// case the caller starts the app itself.
+    /// </summary>
+    private static bool TryHandOffRenameUrl(string url)
+    {
+        try
+        {
+            using var pipe = new NamedPipeClientStream(".", TrayContext.RenamePipeName, PipeDirection.Out);
+            pipe.Connect(10000); // generous: a running instance mid-transcription must not drop the request
+            using var writer = new StreamWriter(pipe, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            writer.WriteLine(url);
+            writer.Flush();
+            return true;
+        }
+        catch (IOException)
+        {
+            return false; // No pipe server: no running instance to hand off to.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Hidden CLI helper: prints what <see cref="RenameRequest.TryParse"/> makes of a URL.</summary>
+    private static void RunParseUrl(string url)
+    {
+        var request = RenameRequest.TryParse(url);
+        if (request is null)
+        {
+            Console.WriteLine("null");
+            return;
+        }
+
+        Console.WriteLine($"SessionFolder={request.SessionFolder}");
+        foreach (var (label, name) in request.Assignments)
+            Console.WriteLine($"Assign: {label} = {name}");
+    }
+
+    /// <summary>Hidden CLI helper: registers the protocol and prints the stored command.</summary>
+    private static void RunRegisterProtocol()
+    {
+        Shortcuts.EnsureProtocolHandler();
+        Console.WriteLine($"command = {Shortcuts.ReadProtocolCommand()}");
     }
 
     /// <summary>
