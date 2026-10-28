@@ -65,6 +65,19 @@ public sealed class Settings
     /// </summary>
     public string ForceHotkey { get; set; } = "Ctrl+Shift+Alt+R";
 
+    /// <summary>
+    /// Base URL of the GPU transcription service (see service/README.md), e.g.
+    /// "http://10.0.0.129:8095". Empty = always transcribe with the local Python
+    /// sidecar. Old settings.json files without this key get the default.
+    /// </summary>
+    public string TranscribeServiceUrl { get; set; } = "http://10.0.0.129:8095";
+
+    /// <summary>
+    /// When the GPU service is unreachable (or a remote job fails), run the local
+    /// Python sidecar on the same session instead of reporting a failure.
+    /// </summary>
+    public bool TranscribeFallbackToLocal { get; set; } = true;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,

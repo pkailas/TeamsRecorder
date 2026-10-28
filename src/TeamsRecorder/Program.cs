@@ -46,6 +46,19 @@ internal static class Program
             return;
         }
 
+        // Hidden CLI switch: --remote-transcribe <sessionFolder> [serviceUrlOverride]
+        // Runs the transcription pipeline (see SidecarRunner.TryStart) on an existing
+        // session folder — <folder>\mic.wav + <folder>\loopback.wav — and blocks until it
+        // finishes, printing the exit code and the tail of sidecar.log. Lets the remote
+        // service path be exercised without the tray app. The optional second argument
+        // overrides Settings.TranscribeServiceUrl for this run only (e.g. a dead port to
+        // watch the local fallback happen).
+        if (args.Length >= 2 && args[0] == "--remote-transcribe")
+        {
+            RunRemoteTranscribe(args[1], args.Length >= 3 ? args[2] : null);
+            return;
+        }
+
         // A meeting page's "Save names" click arrives as a teamsrecorder:// URL. If an
         // instance is already running, hand the URL over the named pipe and exit; if the
         // app is not running, fall through to normal startup and let TrayContext process
@@ -107,6 +120,64 @@ internal static class Program
         Console.WriteLine($"SessionFolder={request.SessionFolder}");
         foreach (var (label, name) in request.Assignments)
             Console.WriteLine($"Assign: {label} = {name}");
+    }
+
+    /// <summary>
+    /// Hidden CLI helper: runs one transcription (remote when a service URL is configured,
+    /// local otherwise) against an existing session folder and reports the outcome.
+    /// </summary>
+    private static void RunRemoteTranscribe(string sessionFolder, string? serviceUrlOverride)
+    {
+        if (!Directory.Exists(sessionFolder))
+        {
+            Console.WriteLine($"[remote-transcribe] FAIL: no such folder: {sessionFolder}");
+            Environment.Exit(1);
+            return;
+        }
+
+        var settings = Settings.Load();
+        if (serviceUrlOverride is not null)
+            settings.TranscribeServiceUrl = serviceUrlOverride;
+
+        var mic = Path.Combine(sessionFolder, "mic.wav");
+        var loopback = Path.Combine(sessionFolder, "loopback.wav");
+
+        Console.WriteLine($"[remote-transcribe] folder={sessionFolder}");
+        Console.WriteLine($"[remote-transcribe] service={settings.TranscribeServiceUrl} fallback={settings.TranscribeFallbackToLocal}");
+
+        var done = new ManualResetEventSlim(false);
+        int exitCode = -1;
+        string? error = null;
+
+        var started = SidecarRunner.TryStart(settings, mic, loopback, sessionFolder, (code, message) =>
+        {
+            exitCode = code;
+            error = message;
+            done.Set();
+        });
+
+        Console.WriteLine($"[remote-transcribe] started={started}");
+        if (!started && error is null)
+            error = "nothing was started";
+
+        done.Wait(); // The job is the point of the switch: block for as long as it takes.
+
+        Console.WriteLine($"exit={exitCode} error={error ?? "(none)"}");
+
+        var logPath = Path.Combine(sessionFolder, "sidecar.log");
+        Console.WriteLine($"--- tail of {logPath} ---");
+        try
+        {
+            var lines = File.ReadLines(logPath).ToList();
+            foreach (var line in lines.Skip(Math.Max(0, lines.Count - 15)))
+                Console.WriteLine(line);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"(sidecar.log unreadable: {ex.Message})");
+        }
+
+        Environment.Exit(exitCode == 0 ? 0 : 1);
     }
 
     /// <summary>Hidden CLI helper: prints every capture audio session and the CallActive verdict.</summary>
