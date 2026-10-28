@@ -41,6 +41,18 @@ public sealed class Settings
     /// <summary>Path to the ffmpeg executable used for video encoding.</summary>
     public string FfmpegExe { get; set; } = @"G:\tools\ffmpeg\8.0.1\ffmpeg.exe";
 
+    /// <summary>
+    /// Stop the recording automatically once the meeting window has been gone for
+    /// <see cref="AutoStopGraceSeconds"/>. False = manual stop only (the pre-auto-stop behaviour).
+    /// </summary>
+    public bool AutoStopOnMeetingEnd { get; set; } = true;
+
+    /// <summary>
+    /// How long (seconds) the meeting window must stay missing before the recording is
+    /// auto-stopped. Absorbs the window churn of navigating elsewhere in Teams mid-meeting.
+    /// </summary>
+    public int AutoStopGraceSeconds { get; set; } = 60;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,

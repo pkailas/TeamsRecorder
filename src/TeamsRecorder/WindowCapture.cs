@@ -56,6 +56,13 @@ public sealed class WindowCapture : IDisposable
     private string? _sessionDir;
     private string _outputMp4 = "";
 
+    /// <summary>
+    /// Meeting title (see <see cref="SessionInfo.ParseMeetingTitle"/>) of the window passed to
+    /// <see cref="Start"/>, or null when it could not be parsed. The re-acquire loop re-attaches
+    /// ONLY to a window with this title — never to "some" ms-teams window.
+    /// </summary>
+    private string? _meetingTitle;
+
     // --- D3D11 ---
     private ID3D11Device? _device;
     private ID3D11DeviceContext? _context;
@@ -108,6 +115,10 @@ public sealed class WindowCapture : IDisposable
             _sessionDir = Path.GetDirectoryName(outputMp4);
             _stopRequested = false;
             _hwnd = hwnd;
+
+            // Remember which meeting we are capturing so ReacquireLoop can never hand the
+            // encoder a different window (a chat window after the meeting ended, for example).
+            _meetingTitle = SessionInfo.ParseMeetingTitle(hwnd == IntPtr.Zero ? null : GetWindowTitle(hwnd));
 
             // Make the process per-monitor DPI-aware so window rects / capture coords line up.
             SetProcessDpiAwarenessContext(PER_MONITOR_DPI_AWARE);
@@ -388,8 +399,16 @@ public sealed class WindowCapture : IDisposable
         _itemClosed = false;
     }
 
+    /// <summary>
+    /// Background poll: when the captured window is gone, re-attach to the window of the SAME
+    /// meeting only. The generic finder (FindTeamsMeetingWindowCore) falls back to the largest
+    /// ms-teams window, which is what made a finished meeting keep recording an unrelated chat
+    /// window; with no meeting-titled window we therefore wait (logging once per disappearance)
+    /// and let the TrayContext auto-stop watcher end the session.
+    /// </summary>
     private void ReacquireLoop()
     {
+        var goneLogged = false;
         try
         {
             while (!_stopRequested)
@@ -399,19 +418,43 @@ public sealed class WindowCapture : IDisposable
                     break;
 
                 bool needAttach;
+                string? meetingTitle;
                 lock (_lock)
                 {
                     needAttach = _item is null || _itemClosed
                         || _hwnd == IntPtr.Zero
                         || !IsWindow(_hwnd)
                         || !IsWindowVisible(_hwnd);
+                    meetingTitle = _meetingTitle;
                 }
                 if (!needAttach)
+                {
+                    goneLogged = false;
                     continue;
+                }
 
-                var (hwnd, title, _) = FindTeamsMeetingWindowCore();
-                if (hwnd == IntPtr.Zero)
+                if (string.IsNullOrEmpty(meetingTitle))
+                {
+                    // No meeting title to re-attach to: capturing "some" Teams window would
+                    // record content that is not this session's meeting. Stay detached.
+                    if (!goneLogged)
+                    {
+                        Log?.Invoke("Captured window closed and the session has no meeting title; not re-attaching.");
+                        goneLogged = true;
+                    }
                     continue;
+                }
+
+                var hwnd = FindTeamsWindowByMeetingTitle(meetingTitle);
+                if (hwnd == IntPtr.Zero)
+                {
+                    if (!goneLogged)
+                    {
+                        Log?.Invoke($"Meeting window \"{meetingTitle}\" gone; waiting for it to return.");
+                        goneLogged = true;
+                    }
+                    continue;
+                }
 
                 lock (_lock)
                 {
@@ -420,7 +463,8 @@ public sealed class WindowCapture : IDisposable
                     DetachLocked();
                     AttachLocked(hwnd);
                 }
-                Log?.Invoke($"Re-attached to meeting window 0x{hwnd:X} ({title}).");
+                goneLogged = false;
+                Log?.Invoke($"Re-attached to meeting window 0x{hwnd:X} ({GetWindowTitle(hwnd)}).");
             }
         }
         catch (ThreadInterruptedException)
@@ -737,9 +781,41 @@ public sealed class WindowCapture : IDisposable
         return hwnd;
     }
 
-    /// <summary>Returns (hwnd, title, allCandidates) for the best meeting window.</summary>
-    public static (IntPtr hwnd, string title, List<(IntPtr Hwnd, string Title, int W, int H)> candidates)
-        FindTeamsMeetingWindowCore()
+    /// <summary>
+    /// Finds the visible top-level ms-teams window whose meeting title (first " | " segment, see
+    /// <see cref="SessionInfo.ParseMeetingTitle"/>) equals <paramref name="meetingTitle"/>
+    /// (ordinal, case-sensitive), or <see cref="IntPtr.Zero"/> when there is none. When several
+    /// windows carry the same meeting title the largest one wins.
+    ///
+    /// This is the "is my meeting still open?" test — it never falls back to "some" ms-teams
+    /// window the way <see cref="FindTeamsMeetingWindowCore"/> does.
+    /// </summary>
+    public static IntPtr FindTeamsWindowByMeetingTitle(string meetingTitle)
+    {
+        if (string.IsNullOrEmpty(meetingTitle))
+            return IntPtr.Zero;
+
+        (IntPtr Hwnd, int Area)? best = null;
+        foreach (var c in EnumerateTeamsWindows())
+        {
+            if (!string.Equals(SessionInfo.ParseMeetingTitle(c.Title), meetingTitle, StringComparison.Ordinal))
+                continue;
+
+            var area = (long)c.W * c.H;
+            if (best is null || area > best.Value.Area)
+                best = (c.Hwnd, (int)area);
+        }
+
+        return best is null ? IntPtr.Zero : best.Value.Hwnd;
+    }
+
+    /// <summary>
+    /// Shared window discovery: every visible top-level window belonging to an ms-teams process
+    /// with a non-empty title and a non-zero size. Used by both the record-start picker
+    /// (<see cref="FindTeamsMeetingWindowCore"/>) and the per-meeting lookup
+    /// (<see cref="FindTeamsWindowByMeetingTitle"/>).
+    /// </summary>
+    private static List<(IntPtr Hwnd, string Title, int W, int H)> EnumerateTeamsWindows()
     {
         var pidSet = new HashSet<int>();
         foreach (var p in Process.GetProcessesByName("ms-teams"))
@@ -750,7 +826,7 @@ public sealed class WindowCapture : IDisposable
             }
         }
         if (pidSet.Count == 0)
-            return (IntPtr.Zero, "", new List<(IntPtr, string, int, int)>());
+            return new List<(IntPtr Hwnd, string Title, int W, int H)>();
 
         var candidates = new List<(IntPtr Hwnd, string Title, int W, int H)>();
         EnumWindows((hwnd, _) =>
@@ -775,6 +851,14 @@ public sealed class WindowCapture : IDisposable
             return true;
         }, IntPtr.Zero);
 
+        return candidates;
+    }
+
+    /// <summary>Returns (hwnd, title, allCandidates) for the best meeting window.</summary>
+    public static (IntPtr hwnd, string title, List<(IntPtr Hwnd, string Title, int W, int H)> candidates)
+        FindTeamsMeetingWindowCore()
+    {
+        var candidates = EnumerateTeamsWindows();
         if (candidates.Count == 0)
             return (IntPtr.Zero, "", candidates);
 

@@ -26,6 +26,25 @@ public sealed class TrayContext : ApplicationContext
     private DateTime _startedAt;
     private WindowCapture? _videoCapture;
 
+    // --- Auto-stop when the meeting window is gone (see StartAutoStopWatcher) ---
+    /// <summary>How often the auto-stop watcher looks for the meeting window.</summary>
+    private const int AutoStopTickMs = 2000;
+
+    /// <summary>2 s UI-thread watcher; started per recording session, never runs while idle.</summary>
+    private readonly System.Windows.Forms.Timer _autoStopTimer;
+
+    /// <summary>Meeting title the watcher looks for; null while the watcher is off.</summary>
+    private string? _autoStopTitle;
+
+    /// <summary>When the meeting window was first seen missing this episode; null while present.</summary>
+    private DateTime? _meetingMissingSince;
+
+    /// <summary>True once "gone" has been logged for the current episode (no per-tick spam).</summary>
+    private bool _meetingGoneLogged;
+
+    /// <summary>True once the watcher has auto-stopped; blocks a second StopRecording call.</summary>
+    private bool _autoStopFired;
+
     /// <summary>
     /// The SynchronizationContext of the UI thread (set in the constructor while
     /// still on it), used to marshal sidecar callbacks back to the UI thread.
@@ -193,6 +212,10 @@ public sealed class TrayContext : ApplicationContext
         _timer.Tick += (_, _) => UpdateTooltip();
         _timer.Start();
 
+        // --- Auto-stop watcher (started per session in StartRecording) ---
+        _autoStopTimer = new System.Windows.Forms.Timer { Interval = AutoStopTickMs };
+        _autoStopTimer.Tick += (_, _) => AutoStopTick();
+
         // --- teamsrecorder://rename hand-offs ---
         StartRenamePipeServer();
         if (_pendingUrl is not null)
@@ -224,6 +247,9 @@ public sealed class TrayContext : ApplicationContext
             // and never blocks or fails audio recording.
             var (hwnd, windowTitle) = FindMeetingWindowForSession();
             WriteSessionInfo(hwnd, windowTitle);
+
+            // --- Auto-stop watcher (independent of video capture) ---
+            StartAutoStopWatcher(SessionInfo.ParseMeetingTitle(hwnd == IntPtr.Zero ? null : windowTitle));
 
             // --- Video capture (best-effort; audio is already running) ---
             if (_settings.VideoOn)
@@ -383,6 +409,10 @@ public sealed class TrayContext : ApplicationContext
         if (!_recorder.IsRecording)
             return;
 
+        // The recording is ending by definition — the watcher has nothing left to watch,
+        // and stopping it here is also the re-entrancy guard for the auto-stop path.
+        StopAutoStopWatcher();
+
         try
         {
             // Stop video before audio so both end at the same wall-clock moment.
@@ -406,6 +436,109 @@ public sealed class TrayContext : ApplicationContext
             _startItem.Enabled = true;
             _stopItem.Enabled = false;
             MessageBox.Show(ex.Message, "Teams Recorder — stop failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    /// <summary>
+    /// Arms the meeting-window watcher for a new session. Runs on the UI thread and does not
+    /// depend on video capture, so it also covers VideoOn=false. A null/unparseable title means
+    /// there is nothing to watch for — recording then stays manual-stop only, as before.
+    /// </summary>
+    private void StartAutoStopWatcher(string? meetingTitle)
+    {
+        StopAutoStopWatcher();
+
+        if (!_settings.AutoStopOnMeetingEnd)
+        {
+            LogVideo("auto-stop disabled: AutoStopOnMeetingEnd=false.", "recorder.log");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(meetingTitle))
+        {
+            LogVideo("Auto-stop disabled: no meeting title.", "recorder.log");
+            return;
+        }
+
+        _autoStopTitle = meetingTitle;
+        _autoStopFired = false;
+        _meetingMissingSince = null;
+        _meetingGoneLogged = false;
+        _autoStopTimer.Start();
+        LogVideo($"auto-stop armed: watching for meeting window \"{meetingTitle}\" " +
+                 $"(grace {_settings.AutoStopGraceSeconds} s).", "recorder.log");
+    }
+
+    /// <summary>Disarms the watcher and clears its episode state. Safe to call any time.</summary>
+    private void StopAutoStopWatcher()
+    {
+        _autoStopTimer.Stop();
+        _autoStopTitle = null;
+        _meetingMissingSince = null;
+        _meetingGoneLogged = false;
+    }
+
+    /// <summary>
+    /// Watcher tick (UI thread, every <see cref="AutoStopTickMs"/>): the meeting window is
+    /// present → reset the missing clock; missing for <see cref="Settings.AutoStopGraceSeconds"/>
+    /// straight → log it, stop the recording through the normal StopRecording path (video stop,
+    /// audio stop, auto-transcribe) and balloon the user.
+    /// </summary>
+    private void AutoStopTick()
+    {
+        try
+        {
+            // Re-entrancy guard: StopRecording() already stopped the timer, so a tick that is
+            // already queued must not stop a second time.
+            if (_autoStopFired)
+                return;
+
+            var title = _autoStopTitle;
+            if (string.IsNullOrEmpty(title) || !_recorder.IsRecording)
+            {
+                StopAutoStopWatcher();
+                return;
+            }
+
+            var present = WindowCapture.FindTeamsWindowByMeetingTitle(title) != IntPtr.Zero;
+            if (present)
+            {
+                if (_meetingMissingSince is { } since)
+                {
+                    LogVideo($"Meeting window \"{title}\" back after " +
+                             $"{(int)(DateTime.Now - since).TotalSeconds} s.", "recorder.log");
+                }
+                _meetingMissingSince = null;
+                _meetingGoneLogged = false;
+                return;
+            }
+
+            _meetingMissingSince ??= DateTime.Now;
+            var missingSeconds = (int)(DateTime.Now - _meetingMissingSince.Value).TotalSeconds;
+
+            var grace = Math.Max(1, _settings.AutoStopGraceSeconds);
+            if (missingSeconds < grace)
+            {
+                if (!_meetingGoneLogged)
+                {
+                    LogVideo($"Meeting window \"{title}\" gone; auto-stopping in " +
+                             $"{Math.Max(0, grace - missingSeconds)} s if it does not return.", "recorder.log");
+                    _meetingGoneLogged = true;
+                }
+                return;
+            }
+
+            _autoStopFired = true;
+            LogVideo($"Meeting window \"{title}\" gone for {missingSeconds} s — auto-stopping.", "recorder.log");
+            StopAutoStopWatcher();
+            StopRecording();
+            ShowBalloon("Meeting ended", "Recording stopped — the meeting window is gone.");
+        }
+        catch (Exception ex)
+        {
+            // A watcher failure must never take the tray app (or the recording) down.
+            Debug.WriteLine($"auto-stop tick failed: {ex}");
+            LogVideo($"auto-stop tick failed: {ex.Message}", "recorder.log");
         }
     }
 
@@ -491,6 +624,7 @@ public sealed class TrayContext : ApplicationContext
 
         _renamePipeCts.Cancel();
         _timer.Stop();
+        StopAutoStopWatcher();
         _hotkeys.Dispose();
         _recorder.Dispose();
         _notifyIcon.Visible = false;
