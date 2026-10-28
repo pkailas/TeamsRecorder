@@ -12,8 +12,15 @@ public sealed class TrayContext : ApplicationContext
 {
     private readonly Recorder _recorder = new();
     private readonly HotkeyManager _hotkeys = new();
+
+    /// <summary>
+    /// Second manager for <see cref="Settings.ForceHotkey"/>. Each HotkeyManager owns its own
+    /// hidden window, and RegisterHotKey keys on (hWnd, id), so the shared HotkeyId does not collide.
+    /// </summary>
+    private readonly HotkeyManager _forceHotkeys = new();
     private readonly System.Windows.Forms.Timer _timer;
     private readonly ToolStripMenuItem _startItem;
+    private readonly ToolStripMenuItem _forceStartItem;
     private readonly ToolStripMenuItem _stopItem;
     private readonly NotifyIcon _notifyIcon;
     private readonly Settings _settings;
@@ -100,6 +107,9 @@ public sealed class TrayContext : ApplicationContext
         _startItem = new ToolStripMenuItem("Start recording");
         _startItem.Click += (_, _) => StartRecording();
 
+        _forceStartItem = new ToolStripMenuItem("Start recording (force)");
+        _forceStartItem.Click += (_, _) => StartRecording(force: true);
+
         _stopItem = new ToolStripMenuItem("Stop recording");
         _stopItem.Click += (_, _) => StopRecording();
 
@@ -149,6 +159,7 @@ public sealed class TrayContext : ApplicationContext
         // Keep the "Start with Windows" check state current every time the menu opens.
         menu.Opening += (_, _) => _startWithWindowsItem.Checked = Shortcuts.StartupEnabled;
         menu.Items.Add(_startItem);
+        menu.Items.Add(_forceStartItem);
         menu.Items.Add(_stopItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_nameSpeakersItem);
@@ -189,11 +200,21 @@ public sealed class TrayContext : ApplicationContext
         catch { /* best-effort on startup */ }
 
         // --- Hotkey ---
-        _hotkeys.HotkeyPressed += ToggleRecording;
+        _hotkeys.HotkeyPressed += () => ToggleRecording();
         if (!_hotkeys.TryRegister(_settings.Hotkey, out var hotkeyError))
         {
             if (hotkeyError is not null)
                 MessageBox.Show(hotkeyError, "Teams Recorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        // --- Force hotkey: starts a recording even when no Teams meeting is detected ---
+        // Registering it on the second HotkeyManager does not collide with the hotkey above
+        // (own hidden window), and a failure is non-fatal: the app keeps running.
+        _forceHotkeys.HotkeyPressed += () => ToggleRecording(force: true);
+        if (!_forceHotkeys.TryRegister(_settings.ForceHotkey, out var forceHotkeyError))
+        {
+            if (forceHotkeyError is not null)
+                MessageBox.Show(forceHotkeyError, "Teams Recorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         // --- Restore the most recent session across app restarts/crashes ---
@@ -222,23 +243,45 @@ public sealed class TrayContext : ApplicationContext
             _uiContext?.Post(_ => HandleRenameUrl(_pendingUrl), null);
     }
 
-    private void ToggleRecording()
+    private void ToggleRecording(bool force = false)
     {
         if (_recorder.IsRecording)
             StopRecording();
         else
-            StartRecording();
+            StartRecording(force);
     }
 
-    private void StartRecording()
+    private void StartRecording(bool force = false)
     {
         if (_recorder.IsRecording)
             return;
+
+        // --- Meeting gate (see TeamsCallDetector) ---
+        // Teams only opens the microphone while it is in a call, so a Teams-owned active
+        // capture session is the evidence. The force hotkey skips the gate but the probe is
+        // still run (once, a few ms) so the forced-start log line reports the truth.
+        var callDetected = false;
+        if (force || _settings.RequireMeetingToStart)
+        {
+            var status = TeamsCallDetector.Probe();
+            callDetected = status.CallActive;
+
+            if (!force && !callDetected)
+            {
+                Debug.WriteLine(status.Describe());
+                ShowBalloon("No Teams meeting in progress",
+                    $"Not recording. Press {_settings.ForceHotkey} to record anyway.");
+                return;
+            }
+        }
 
         try
         {
             _recorder.Start(_settings);
             _startedAt = DateTime.Now;
+
+            if (force)
+                LogVideo($"Forced start (meeting check bypassed; call detected: {(callDetected ? "true" : "false")}).", "recorder.log");
 
             // --- Meeting window + session.json ---
             // The session folder exists now (Recorder.Start created it), and the
@@ -256,6 +299,7 @@ public sealed class TrayContext : ApplicationContext
                 StartVideoCapture(hwnd);
             UpdateIcon(recording: true);
             _startItem.Enabled = false;
+            _forceStartItem.Enabled = false;
             _stopItem.Enabled = true;
             ShowBalloon("Recording started",
                 $"Recording to {_recorder.SessionFolder}. Press {_settings.Hotkey} to stop.");
@@ -264,6 +308,7 @@ public sealed class TrayContext : ApplicationContext
         {
             UpdateIcon(recording: false);
             _startItem.Enabled = true;
+            _forceStartItem.Enabled = true;
             _stopItem.Enabled = false;
             MessageBox.Show(ex.Message, "Teams Recorder — start failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -421,6 +466,7 @@ public sealed class TrayContext : ApplicationContext
             var (micWav, loopbackWav) = _recorder.Stop();
             UpdateIcon(recording: false);
             _startItem.Enabled = true;
+            _forceStartItem.Enabled = true;
             _stopItem.Enabled = false;
             ShowBalloon("Recording stopped",
                 "WAV files written. " + (_settings.AutoTranscribe ? "Transcription starting…" : ""));
@@ -434,6 +480,7 @@ public sealed class TrayContext : ApplicationContext
         {
             UpdateIcon(recording: false);
             _startItem.Enabled = true;
+            _forceStartItem.Enabled = true;
             _stopItem.Enabled = false;
             MessageBox.Show(ex.Message, "Teams Recorder — stop failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -626,6 +673,7 @@ public sealed class TrayContext : ApplicationContext
         _timer.Stop();
         StopAutoStopWatcher();
         _hotkeys.Dispose();
+        _forceHotkeys.Dispose();
         _recorder.Dispose();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();

@@ -53,6 +53,18 @@ public sealed class Settings
     /// </summary>
     public int AutoStopGraceSeconds { get; set; } = 60;
 
+    /// <summary>
+    /// Refuse to start a recording unless <see cref="TeamsCallDetector"/> sees a Teams
+    /// process holding an active microphone session. False = start unconditionally.
+    /// </summary>
+    public bool RequireMeetingToStart { get; set; } = true;
+
+    /// <summary>
+    /// Global hotkey that starts a recording even when no Teams meeting is detected
+    /// (same toggle semantics as <see cref="Hotkey"/>).
+    /// </summary>
+    public string ForceHotkey { get; set; } = "Ctrl+Shift+Alt+R";
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,

@@ -36,6 +36,16 @@ internal static class Program
             return;
         }
 
+        // Hidden CLI switch: --meeting-probe
+        // Prints every microphone audio session (device | pid | process | teams | state)
+        // and the CallActive verdict, then exits. Used to check live what the record-start
+        // gate sees — in particular which process owns the Teams capture session.
+        if (args.Length == 1 && args[0] == "--meeting-probe")
+        {
+            RunMeetingProbe();
+            return;
+        }
+
         // A meeting page's "Save names" click arrives as a teamsrecorder:// URL. If an
         // instance is already running, hand the URL over the named pipe and exit; if the
         // app is not running, fall through to normal startup and let TrayContext process
@@ -97,6 +107,20 @@ internal static class Program
         Console.WriteLine($"SessionFolder={request.SessionFolder}");
         foreach (var (label, name) in request.Assignments)
             Console.WriteLine($"Assign: {label} = {name}");
+    }
+
+    /// <summary>Hidden CLI helper: prints every capture audio session and the CallActive verdict.</summary>
+    private static void RunMeetingProbe()
+    {
+        var status = TeamsCallDetector.Probe();
+
+        foreach (var session in status.Sessions)
+            Console.WriteLine(TeamsCallDetector.FormatSession(session));
+
+        if (status.Error is { } error)
+            Console.WriteLine($"probe error: {error}");
+
+        Console.WriteLine($"CallActive: {(status.CallActive ? "True" : "False")}");
     }
 
     /// <summary>Hidden CLI helper: registers the protocol and prints the stored command.</summary>
