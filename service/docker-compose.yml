@@ -1,0 +1,45 @@
+# TeamsRecorder GPU transcription service — BEAUTY (Ubuntu, NVIDIA RTX PRO 4000).
+#
+# Deploy: cd <repo>/service && docker compose up -d --build
+# Models must exist at ~/models/teamsrecorder/{whisper,hf} (CTranslate2
+# large-v3 + the pyannote HF hub cache) — mounted read-only.
+services:
+  teamsrecorder-transcribe:
+    build:
+      context: ..
+      dockerfile: service/Dockerfile
+    image: teamsrecorder-transcribe:latest
+    container_name: teamsrecorder-transcribe
+    ports:
+      - "8095:8095"
+    volumes:
+      - ~/models/teamsrecorder:/models:ro
+    environment:
+      WHISPER_MODELS: /models/whisper
+      HF_HOME: /models/hf
+      HF_HUB_OFFLINE: "1"
+      HF_TOKEN: offline
+      TR_JOBS_DIR: /tmp
+      # uvicorn's per-multipart-part cap: 1 GiB per file (a 3-hour meeting is
+      # ~350 MB per WAV).
+      LIMIT_FORM_PART_KIB: "1048576"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/health', timeout=10)"
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s

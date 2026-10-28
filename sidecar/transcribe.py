@@ -31,6 +31,7 @@ Self-test (acceptance check for GPU):
 """
 from __future__ import annotations
 import argparse
+import gc
 import glob
 import html
 import json
@@ -47,9 +48,14 @@ from datetime import datetime
 from pathlib import Path
 
 # --------------------------------------------------------------------------
-# Hugging Face cache location (must be set before any HF-related import).
+# Model cache locations (must be set before any HF-related import).
+#   HF_HOME       — Hugging Face hub cache (pyannote models)
+#   WHISPER_MODELS — faster-whisper / CTranslate2 model cache
+# Defaults are BEAST's G: drive; the GPU service (service\Dockerfile) passes
+# the container paths /models/hf and /models/whisper instead.
 # --------------------------------------------------------------------------
 os.environ.setdefault("HF_HOME", r"G:\models\hf")
+WHISPER_MODELS_DIR = os.environ.get("WHISPER_MODELS") or r"G:\models\whisper"
 
 # --------------------------------------------------------------------------
 # HF_TOKEN fallback: the tray app launches the sidecar detached from the
@@ -862,7 +868,7 @@ def run_transcription(args) -> int:
     # float16 is hard-coded on purpose: int8 / int8_float16 crash on sm_120
     # (Blackwell) with CUBLAS_STATUS_NOT_SUPPORTED.
     model = WhisperModel(model_name, device="cuda", compute_type="float16",
-                         download_root=r"G:\models\whisper")
+                         download_root=WHISPER_MODELS_DIR)
 
     def transcribe(path_str: str):
         """Returns list of segment dicts (start, end, text, words).
@@ -941,6 +947,15 @@ def run_transcription(args) -> int:
         else:
             # Transcribe, keeping words.
             loop_segs = transcribe(str(loopback_path))
+
+            # -- Whisper is finished: release it NOW, before diarization, so the
+            #    pyannote models get the whole GPU. (In the GPU service the job
+            #    runs as its own process, which releases the CUDA context too.)
+            model = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            log("Unloaded whisper")
+
             words = []
             for seg in loop_segs:
                 for w in seg["words"]:
@@ -961,6 +976,13 @@ def run_transcription(args) -> int:
             log(f"Diarization done in {time.monotonic() - t_diar:.1f}s")
             diar_turns_out = [{"start": s, "end": e, "label": l} for (s, e, l) in turns]
             log(f"Diarization: {len(turns)} turns: {turns[:5]}{'...' if len(turns) > 5 else ''}")
+
+            # -- Diarization is finished: release the pipeline before loading the
+            #    embedding model (same reason as the whisper unload above).
+            diar_pipe = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            log("Unloaded pyannote diarization")
 
             # -- Speaker voice embeddings + name matching ------------------
             emb_by_label: dict[str, np.ndarray] = {}
@@ -1106,7 +1128,11 @@ def run_transcription(args) -> int:
         log(f"mux: unexpected error, skipped: {exc}")
 
     # -- Free GPU ----------------------------------------------------------
-    del model
+    # Normally model was already released after the loopback transcription and
+    # diar_pipe after diarization; this covers the paths that skipped them
+    # (missing/short loopback, --no-embeddings, cpu-only).
+    model = None
+    gc.collect()
     torch.cuda.empty_cache()
     total_elapsed = time.monotonic() - t_total_start
     rt = total_elapsed / total_duration if total_duration > 0 else 0.0
@@ -1252,7 +1278,7 @@ def run_selftest() -> int:
     log("Loading faster-whisper large-v3 (float16, cuda)...")
     from faster_whisper import WhisperModel
     model = WhisperModel("large-v3", device="cuda", compute_type="float16",
-                         download_root=r"G:\models\whisper")
+                         download_root=WHISPER_MODELS_DIR)
     audio = load_wav_mono_float32(tmp_wav, target_rate=16000)
     seg_iter, _info = model.transcribe(audio, language="en",
                                        word_timestamps=True, vad_filter=True)

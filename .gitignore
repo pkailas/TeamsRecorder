@@ -23,3 +23,4 @@ MEMORY.md
 
 sidecar/*.log
 sidecar/__pycache__/
+__pycache__/
