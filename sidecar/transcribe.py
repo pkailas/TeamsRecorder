@@ -96,6 +96,16 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# --------------------------------------------------------------------------
+# Loopback utterance grouping: a new utterance starts when the speaker changes
+# OR when the silence between the previous word's end and this word's start is
+# longer than this (seconds). Without the gap check, one diarization label that
+# spans a long 1:1 exchange (the other side only speaks in replies) collapses
+# every reply into a single multi-minute utterance that sorts before the local
+# user's questions. Override with --utterance-gap.
+# --------------------------------------------------------------------------
+UTTERANCE_GAP_SEC = 1.5
+
 
 # --------------------------------------------------------------------------
 # Small helpers
@@ -1036,12 +1046,19 @@ def run_transcription(args) -> int:
                 [_W(w) for w in words],
                 [(s, e, label_map.get(l, l)) for (s, e, l) in turns])
             utterances = []
+            utterance_gap = float(getattr(args, "utterance_gap", UTTERANCE_GAP_SEC))
             for i, (wstart, wend, speaker) in enumerate(labeled):
                 word_text = words[i]["word"]
-                if utterances and utterances[-1]["speaker"] == speaker:
-                    utterances[-1]["end"] = wend
+                prev = utterances[-1] if utterances else None
+                # Same speaker AND no long pause -> continuation of the current
+                # utterance. A pause longer than utterance_gap means the same
+                # speaker took a new turn (the other side spoke in between on
+                # the mic track, which is transcribed separately).
+                if (prev is not None and prev["speaker"] == speaker
+                        and (wstart - prev["end"]) <= utterance_gap):
+                    prev["end"] = wend
                     # faster-whisper words already carry a leading space
-                    utterances[-1]["text"] += word_text
+                    prev["text"] += word_text
                 else:
                     utterances.append({
                         "start": float(wstart), "end": float(wend),
@@ -1380,6 +1397,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dedup-window", type=float, default=2.0,
                         help="Time window (s) around each mic utterance to "
                              "search for overlapping loopback audio (default: 2.0).")
+    parser.add_argument("--utterance-gap", type=float, default=UTTERANCE_GAP_SEC,
+                        help="Silence gap (s) between consecutive loopback words "
+                             "that ends an utterance even when the speaker label "
+                             "is unchanged (default: 1.5).")
     sub = parser.add_subparsers(dest="command")
     rp = sub.add_parser(
         "rename",
